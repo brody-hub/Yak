@@ -89,8 +89,8 @@ export function createApp(): Express {
   })
 
   // Better Auth reads the raw request stream, so it has to be mounted before
-  // the JSON body parser claims it.
-  app.all("/api/auth/*splat", authLimiter, toNodeHandler(auth))
+  // the JSON body parser claims it. Express 5 uses `{*path}` for wildcards.
+  app.all("/api/auth/{*path}", authLimiter, toNodeHandler(auth))
 
   app.use(express.json({ limit: "1mb" }))
   app.use(cookieParser())

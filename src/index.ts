@@ -3,9 +3,19 @@ import { closeDatabase } from "./db/index.js"
 import { env } from "./env.js"
 import { logger } from "./logger.js"
 
-const app = createApp()
+// Plain stderr so a crash before the logger is ready still shows up in Railway.
+console.error(`[boot] starting ${env.TENANT_NAME} on port ${env.PORT}`)
 
-const server = app.listen(env.PORT, () => {
+let app
+try {
+  app = createApp()
+} catch (error) {
+  console.error("[boot] createApp failed", error)
+  process.exit(1)
+}
+
+const server = app.listen(env.PORT, "0.0.0.0", () => {
+  console.error(`[boot] listening on 0.0.0.0:${env.PORT}`)
   logger.info(
     {
       port: env.PORT,
