@@ -11,6 +11,7 @@ import {
   sendPasswordChangedEmail,
   sendPasswordResetEmail,
 } from "../services/email.js"
+import { ac, authRoles } from "./access.js"
 
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 const SESSION_REFRESH_SECONDS = 60 * 60 * 24
@@ -146,7 +147,10 @@ export const auth = betterAuth({
 
   plugins: [
     adminPlugin({
+      ac,
+      roles: authRoles,
       defaultRole: "member",
+      // Values here must also appear in `roles` above.
       adminRoles: ["owner", "admin"],
     }),
   ],
