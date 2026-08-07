@@ -50,9 +50,11 @@ CLOUDFLARE_EMAIL_API_TOKEN=…
 EMAIL_FROM=no-reply@yourdomain.com
 EMAIL_FROM_NAME=Stand
 
-CLOUDFLARE_IMAGES_API_TOKEN=…
-CLOUDFLARE_IMAGES_ACCOUNT_HASH=…
-CLOUDFLARE_IMAGES_SIGNING_KEY=…
+R2_ACCESS_KEY_ID=…
+R2_SECRET_ACCESS_KEY=…
+R2_BUCKET=yak-media
+# R2_JURISDICTION=          # optional
+# R2_URL_TTL=3600
 ```
 
 `API_URL` and `APP_URL` must be exact, with no trailing slash. `APP_URL` is the
@@ -92,19 +94,39 @@ prints it. Signing in forces an immediate password change.
 what it would have sent and returns the temporary password in the invite
 response instead, so local development still works.
 
-## Cloudflare Images
+## Cloudflare R2
 
-1. Enable Images on the account.
-2. Create an API token with Images read and write.
-3. Copy the account hash from the Images dashboard.
-4. Under Images → Keys, copy the signing key.
-5. Create two variants: `avatar` (square, ~256px) and `branding` (~512px wide).
-6. Set the three `CLOUDFLARE_IMAGES_*` variables.
+1. Open **Storage & databases → R2** and create a bucket (e.g. `yak-media`).
+   Leave it **private** (no public access).
+2. R2 → **Manage R2 API Tokens** → create a token with **Object Read & Write**
+   on that bucket. Copy the Access Key ID and Secret Access Key.
+3. On the bucket → **Settings → CORS**, allow the panel origin to PUT:
 
-Uploads use one-time direct-upload URLs, so files go browser → Cloudflare and
-never through this server. Every image is created with `requireSignedURLs`, and
-delivery URLs are signed with a one hour expiry by default
-(`CLOUDFLARE_IMAGES_URL_TTL`).
+```json
+[
+  {
+    "AllowedOrigins": ["https://your-panel.up.railway.app"],
+    "AllowedMethods": ["PUT", "GET", "HEAD"],
+    "AllowedHeaders": ["Content-Type"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+4. Set on the `yak-server` Railway service:
+
+```bash
+CLOUDFLARE_ACCOUNT_ID=…
+R2_ACCESS_KEY_ID=…
+R2_SECRET_ACCESS_KEY=…
+R2_BUCKET=yak-media
+```
+
+Uploads use short-lived presigned PUT URLs (browser → R2). Reads go through
+`GET /api/media/...`, which 302s to a short-lived signed GET
+(`R2_URL_TTL`, default one hour). Without these variables, avatars still work
+via the inline data-URL fallback; theme logo upload requires R2.
 
 ## Cookies across two hosts
 

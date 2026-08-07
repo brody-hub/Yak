@@ -49,19 +49,11 @@ const schema = z.object({
   EMAIL_FROM: z.preprocess(emptyToUndefined, z.string().email().optional()),
   EMAIL_FROM_NAME: z.preprocess(emptyToUndefined, z.string().optional()),
 
-  CLOUDFLARE_IMAGES_API_TOKEN: z.preprocess(
-    emptyToUndefined,
-    z.string().optional()
-  ),
-  CLOUDFLARE_IMAGES_ACCOUNT_HASH: z.preprocess(
-    emptyToUndefined,
-    z.string().optional()
-  ),
-  CLOUDFLARE_IMAGES_SIGNING_KEY: z.preprocess(
-    emptyToUndefined,
-    z.string().optional()
-  ),
-  CLOUDFLARE_IMAGES_URL_TTL: z.coerce.number().int().positive().default(3600),
+  R2_ACCESS_KEY_ID: z.preprocess(emptyToUndefined, z.string().optional()),
+  R2_SECRET_ACCESS_KEY: z.preprocess(emptyToUndefined, z.string().optional()),
+  R2_BUCKET: z.preprocess(emptyToUndefined, z.string().optional()),
+  R2_JURISDICTION: z.preprocess(emptyToUndefined, z.string().optional()),
+  R2_URL_TTL: z.coerce.number().int().positive().default(3600),
 
   OWNER_EMAIL: z.preprocess(emptyToUndefined, z.string().email().optional()),
   OWNER_NAME: z.preprocess(emptyToUndefined, z.string().optional()),
@@ -100,17 +92,28 @@ export const env = {
     from: raw.EMAIL_FROM,
     fromName: raw.EMAIL_FROM_NAME ?? raw.TENANT_NAME,
   },
+  r2: {
+    configured: Boolean(
+      raw.CLOUDFLARE_ACCOUNT_ID &&
+        raw.R2_ACCESS_KEY_ID &&
+        raw.R2_SECRET_ACCESS_KEY &&
+        raw.R2_BUCKET
+    ),
+    accountId: raw.CLOUDFLARE_ACCOUNT_ID,
+    accessKeyId: raw.R2_ACCESS_KEY_ID,
+    secretAccessKey: raw.R2_SECRET_ACCESS_KEY,
+    bucket: raw.R2_BUCKET,
+    jurisdiction: raw.R2_JURISDICTION,
+    urlTtlSeconds: raw.R2_URL_TTL,
+  },
+  /** Alias of `r2.configured` for boot logs that still say "images". */
   images: {
     configured: Boolean(
       raw.CLOUDFLARE_ACCOUNT_ID &&
-        raw.CLOUDFLARE_IMAGES_API_TOKEN &&
-        raw.CLOUDFLARE_IMAGES_ACCOUNT_HASH
+        raw.R2_ACCESS_KEY_ID &&
+        raw.R2_SECRET_ACCESS_KEY &&
+        raw.R2_BUCKET
     ),
-    accountId: raw.CLOUDFLARE_ACCOUNT_ID,
-    apiToken: raw.CLOUDFLARE_IMAGES_API_TOKEN,
-    accountHash: raw.CLOUDFLARE_IMAGES_ACCOUNT_HASH,
-    signingKey: raw.CLOUDFLARE_IMAGES_SIGNING_KEY,
-    urlTtlSeconds: raw.CLOUDFLARE_IMAGES_URL_TTL,
   },
 } as const
 

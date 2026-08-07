@@ -12,7 +12,7 @@ import type {
   TicketHistoryEntry,
   User,
 } from "../db/schema.js"
-import { signedImageUrl } from "../services/images.js"
+import { signedImageUrl } from "../services/r2.js"
 
 /**
  * Deterministic fallback avatar. Matches the helper the panel uses so an
@@ -32,7 +32,7 @@ function avatarFor(
   row: Pick<User, "name" | "image" | "avatarImageId">
 ): string {
   if (row.avatarImageId) {
-    const signed = signedImageUrl(row.avatarImageId, "avatar")
+    const signed = signedImageUrl(row.avatarImageId)
 
     if (signed) {
       return signed
@@ -270,9 +270,7 @@ export function serializeSettings(row: AppSettings) {
   return {
     brandName: row.brandName,
     logoImageId: row.logoImageId,
-    logoUrl: row.logoImageId
-      ? signedImageUrl(row.logoImageId, "branding")
-      : null,
+    logoUrl: row.logoImageId ? signedImageUrl(row.logoImageId) : null,
     primaryColor: row.primaryColor,
     defaultTheme: row.defaultTheme,
     updatedAt: row.updatedAt.toISOString(),

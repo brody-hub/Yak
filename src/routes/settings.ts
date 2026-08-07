@@ -10,7 +10,7 @@ import { serializeSettings } from "../lib/serializers.js"
 import { getAuth } from "../middleware/auth.js"
 import { validate } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
-import { imageExists } from "../services/images.js"
+import { imageExists, isManagedObjectKey } from "../services/r2.js"
 
 export const settingsRouter: Router = Router()
 
@@ -69,7 +69,7 @@ settingsRouter.put(
           .regex(/^#[0-9a-fA-F]{6}$/, "Use a hex colour such as #339af0")
           .optional(),
         defaultTheme: z.enum(["light", "dark", "system"]).optional(),
-        logoImageId: z.string().trim().min(1).max(120).nullable().optional(),
+        logoImageId: z.string().trim().min(1).max(255).nullable().optional(),
       })
       .strict()
       .refine((value) => Object.keys(value).length > 0, {
@@ -87,8 +87,16 @@ settingsRouter.put(
 
     await loadSettings()
 
-    if (body.logoImageId && !(await imageExists(body.logoImageId))) {
-      throw new BadRequestError("That image was not found or was never uploaded")
+    if (body.logoImageId) {
+      if (!isManagedObjectKey(body.logoImageId)) {
+        throw new BadRequestError("Invalid image reference")
+      }
+
+      if (!(await imageExists(body.logoImageId))) {
+        throw new BadRequestError(
+          "That image was not found or was never uploaded"
+        )
+      }
     }
 
     const [row] = await db

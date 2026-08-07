@@ -16,7 +16,7 @@ One deployed instance serves exactly one customer application.
 | Webhooks | Outbound signed webhooks on report lifecycle events. |
 | Discord | Fires configured Discord webhooks on four panel triggers. |
 | Email | Invites and password resets through Cloudflare Email Service. |
-| Images | Avatars and branding logos in Cloudflare Images with signed URLs. |
+| Media | Avatars and branding logos in Cloudflare R2 with presigned URLs. |
 
 Dashboard and KPI data stay as frontend demo data and are deliberately not
 backed by this service yet.
@@ -73,7 +73,7 @@ src/
   db/               Drizzle schema, pool, migration runner
   middleware/       Session, permissions, API keys, validation, errors
   routes/           Panel routers, plus routes/public for the ingest API
-  services/         Cloudflare email + images, Discord, webhooks, activity
+  services/         Cloudflare email + R2, Discord, webhooks, activity
   scripts/          Owner bootstrap and seeding
 ```
 

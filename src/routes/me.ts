@@ -12,7 +12,7 @@ import { serializeActivity, serializeCurrentUser } from "../lib/serializers.js"
 import { getAuth } from "../middleware/auth.js"
 import { validate } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
-import { imageExists } from "../services/images.js"
+import { imageExists, isManagedObjectKey } from "../services/r2.js"
 
 export const meRouter: Router = Router()
 
@@ -144,7 +144,7 @@ meRouter.put(
   validate({
     body: z
       .object({
-        imageId: z.string().trim().min(1).max(120).nullable().optional(),
+        imageId: z.string().trim().min(1).max(255).nullable().optional(),
         dataUrl: z.string().trim().min(1).max(INLINE_AVATAR_MAX_CHARS).nullable().optional(),
       })
       .strict()
@@ -191,10 +191,16 @@ meRouter.put(
     } else {
       const imageId = body.imageId ?? null
 
-      if (imageId && !(await imageExists(imageId))) {
-        throw new BadRequestError(
-          "That image was not found or was never uploaded"
-        )
+      if (imageId) {
+        if (!isManagedObjectKey(imageId)) {
+          throw new BadRequestError("Invalid image reference")
+        }
+
+        if (!(await imageExists(imageId))) {
+          throw new BadRequestError(
+            "That image was not found or was never uploaded"
+          )
+        }
       }
 
       patch.avatarImageId = imageId

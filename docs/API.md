@@ -191,10 +191,10 @@ Any authenticated user.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/status` | Whether Cloudflare Images is configured. |
-| POST | `/direct-upload` | `{ purpose: "avatar" \| "branding" }` → `{ uploadUrl, imageId }` |
+| GET | `/status` | Whether Cloudflare R2 is configured. |
+| POST | `/direct-upload` | `{ purpose, contentType }` → `{ uploadUrl, imageId, method, headers }` |
 
-Flow: request an upload URL, `POST` the file straight to Cloudflare from the
-browser, then send the returned `imageId` to `PUT /api/me/avatar` or
-`PUT /api/settings/theme`. Files never pass through this server. Images are
-created with signed URLs required, so an id alone cannot read the asset.
+Flow: request a presigned upload URL, `PUT` the file straight to R2 from the
+browser, then send the returned `imageId` (object key) to `PUT /api/me/avatar`
+or `PUT /api/settings/theme`. Files never pass through this server. Reads go
+through `GET /api/media/...`, which redirects to a short-lived signed GET.

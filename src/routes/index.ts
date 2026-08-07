@@ -7,13 +7,14 @@ import {
   requirePermission,
 } from "../middleware/permissions.js"
 import { panelLimiter, uploadLimiter } from "../middleware/rate-limit.js"
-import { signedImageUrl } from "../services/images.js"
+import { signedImageUrl } from "../services/r2.js"
 import { activityRouter } from "./activity.js"
 import { analyticsRouter } from "./analytics.js"
 import { apiKeysRouter } from "./api-keys.js"
 import { appUsersRouter } from "./app-users.js"
 import { discordRouter } from "./discord.js"
 import { meRouter } from "./me.js"
+import { mediaRouter } from "./media.js"
 import { publicEventsRouter } from "./public/events.js"
 import { publicReportsRouter } from "./public/reports.js"
 import { publicUsersRouter } from "./public/users.js"
@@ -76,6 +77,9 @@ apiRouter.use(panel)
 
 export const publicMetaRouter: Router = Router()
 
+// Stable avatar/logo URLs redirect here to short-lived R2 signed GETs.
+publicMetaRouter.use("/media", mediaRouter)
+
 /**
  * Lets the login screen render tenant branding before anyone signs in.
  *
@@ -95,7 +99,7 @@ publicMetaRouter.get("/config", async (_req, res) => {
       branding: {
         brandName: settings.brandName,
         logoUrl: settings.logoImageId
-          ? signedImageUrl(settings.logoImageId, "branding")
+          ? signedImageUrl(settings.logoImageId)
           : null,
         primaryColor: settings.primaryColor,
         defaultTheme: settings.defaultTheme,
