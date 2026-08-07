@@ -95,15 +95,30 @@ export function imagesConfigured(): boolean {
   return r2Configured()
 }
 
+/** Maps browser/OS aliases onto the types R2 + our allowlist expect. */
+export function normalizeContentType(contentType: string): string {
+  const normalized = contentType.trim().toLowerCase()
+
+  if (normalized === "image/jpg" || normalized === "image/pjpeg") {
+    return "image/jpeg"
+  }
+
+  if (normalized === "image/x-png") {
+    return "image/png"
+  }
+
+  return normalized
+}
+
 export function isAllowedContentType(contentType: string): boolean {
-  return ALLOWED_CONTENT_TYPES.has(contentType)
+  return ALLOWED_CONTENT_TYPES.has(normalizeContentType(contentType))
 }
 
 export type DirectUpload = {
   uploadUrl: string
   imageId: string
   method: "PUT"
-  headers: { "Content-Type": string }
+  headers: Record<string, string>
 }
 
 function objectKey(params: {
@@ -122,19 +137,28 @@ function objectKey(params: {
 export async function createDirectUpload(params: {
   requestedByUserId: string
   purpose: "avatar" | "branding"
-  contentType: string
+  contentType?: string
 }): Promise<DirectUpload> {
   const { bucket } = requireConfigured()
 
-  if (!isAllowedContentType(params.contentType)) {
+  const contentType = params.contentType
+    ? normalizeContentType(params.contentType)
+    : "image/png"
+
+  if (!ALLOWED_CONTENT_TYPES.has(contentType)) {
     throw new BadRequestError("Unsupported image type")
   }
 
-  const key = objectKey(params)
+  const key = objectKey({
+    purpose: params.purpose,
+    requestedByUserId: params.requestedByUserId,
+    contentType,
+  })
+
   const command = new PutObjectCommand({
     Bucket: bucket,
     Key: key,
-    ContentType: params.contentType,
+    ContentType: contentType,
   })
 
   const uploadUrl = await getSignedUrl(getClient(), command, {
@@ -145,7 +169,7 @@ export async function createDirectUpload(params: {
     uploadUrl,
     imageId: key,
     method: "PUT",
-    headers: { "Content-Type": params.contentType },
+    headers: { "Content-Type": contentType },
   }
 }
 

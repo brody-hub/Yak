@@ -34,12 +34,14 @@ uploadsRouter.post(
     body: z
       .object({
         purpose: z.enum(["avatar", "branding"]),
+        // Optional for older panel builds; defaults to image/png server-side.
         contentType: z
           .string()
           .trim()
           .min(1)
           .max(64)
-          .refine(isAllowedContentType, "Unsupported image type"),
+          .refine(isAllowedContentType, "Unsupported image type")
+          .optional(),
       })
       .strict(),
   }),
@@ -47,7 +49,7 @@ uploadsRouter.post(
     const { user } = getAuth(req)
     const { purpose, contentType } = req.body as {
       purpose: "avatar" | "branding"
-      contentType: string
+      contentType?: string
     }
 
     const upload = await createDirectUpload({
