@@ -27,4 +27,5 @@ USER node
 
 EXPOSE 8080
 
-CMD ["node", "dist/index.js"]
+# Migrate before serving so a fresh Postgres gets schema on first boot.
+CMD ["sh", "-c", "node dist/db/migrate.js && node dist/index.js"]
