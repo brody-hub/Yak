@@ -180,9 +180,9 @@ systemUsersRouter.post(
       data: serializeSystemUser(row),
       meta: {
         inviteEmailSent: delivered,
-        // Without a configured mail provider the operator still needs a way to
-        // hand the credential over.
-        temporaryPassword: delivered ? undefined : temporaryPassword,
+        // Always returned so the admin can copy and send it manually even when
+        // the invite email also went out.
+        temporaryPassword,
       },
     })
   }
@@ -430,7 +430,7 @@ systemUsersRouter.post(
       data: { ok: true },
       meta: {
         inviteEmailSent: delivered,
-        temporaryPassword: delivered ? undefined : temporaryPassword,
+        temporaryPassword,
       },
     })
   }
