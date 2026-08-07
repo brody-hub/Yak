@@ -7,6 +7,7 @@ import {
   requirePermission,
 } from "../middleware/permissions.js"
 import { panelLimiter, uploadLimiter } from "../middleware/rate-limit.js"
+import { signedImageUrl } from "../services/images.js"
 import { activityRouter } from "./activity.js"
 import { analyticsRouter } from "./analytics.js"
 import { apiKeysRouter } from "./api-keys.js"
@@ -17,7 +18,7 @@ import { publicEventsRouter } from "./public/events.js"
 import { publicReportsRouter } from "./public/reports.js"
 import { publicUsersRouter } from "./public/users.js"
 import { reportsRouter } from "./reports.js"
-import { settingsRouter } from "./settings.js"
+import { loadSettings, settingsRouter } from "./settings.js"
 import { systemUsersRouter } from "./system-users.js"
 import { tasksRouter } from "./tasks.js"
 import { uploadsRouter } from "./uploads.js"
@@ -75,14 +76,30 @@ apiRouter.use(panel)
 
 export const publicMetaRouter: Router = Router()
 
-/** Lets the login screen render tenant branding before anyone signs in. */
-publicMetaRouter.get("/config", (_req, res) => {
+/**
+ * Lets the login screen render tenant branding before anyone signs in.
+ *
+ * Only the brand name, logo, and colour are exposed here. Those are visible on
+ * every page of the panel anyway, so there is nothing to protect, and putting
+ * them behind auth would mean an unbranded login screen.
+ */
+publicMetaRouter.get("/config", async (_req, res) => {
+  const settings = await loadSettings()
+
   res.json({
     data: {
       tenantName: env.TENANT_NAME,
       tenantSlug: env.TENANT_SLUG,
       signUpEnabled: false,
       passwordMinLength: 12,
+      branding: {
+        brandName: settings.brandName,
+        logoUrl: settings.logoImageId
+          ? signedImageUrl(settings.logoImageId, "branding")
+          : null,
+        primaryColor: settings.primaryColor,
+        defaultTheme: settings.defaultTheme,
+      },
     },
   })
 })

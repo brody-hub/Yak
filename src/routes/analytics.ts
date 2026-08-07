@@ -194,6 +194,7 @@ analyticsRouter.get(
       name: z.string().trim().max(120).optional(),
       search: z.string().trim().max(200).optional(),
       externalUserId: z.string().trim().max(120).optional(),
+      platform: z.enum(["ios", "android", "web"]).optional(),
     }),
   }),
   async (req, res) => {
@@ -202,10 +203,12 @@ analyticsRouter.get(
       name?: string
       search?: string
       externalUserId?: string
+      platform?: "ios" | "android" | "web"
     }>(req)
 
     const conditions = [
       query.name ? eq(analyticsEvents.name, query.name) : undefined,
+      query.platform ? eq(analyticsEvents.platform, query.platform) : undefined,
       query.externalUserId
         ? eq(analyticsEvents.externalUserId, query.externalUserId)
         : undefined,
