@@ -12,6 +12,22 @@ try {
 
   console.error(`[boot] modules loaded, binding 0.0.0.0:${env.PORT}`)
 
+  // Optional first-boot path when OWNER_EMAIL is set and the users table is empty.
+  const { bootstrapOwnerFromEnv } = await import("./scripts/create-owner.js")
+  const bootstrap = await bootstrapOwnerFromEnv()
+
+  if (bootstrap?.status === "created") {
+    console.error(`[boot] owner created for ${bootstrap.email}`)
+    if (!bootstrap.inviteEmailSent) {
+      console.error(`[boot] temporary password: ${bootstrap.temporaryPassword}`)
+      console.error("[boot] change it immediately after signing in")
+    }
+  } else if (bootstrap?.status === "exists") {
+    console.error(`[boot] owner already exists (${bootstrap.email})`)
+  } else if (bootstrap?.status === "skipped") {
+    console.error(`[boot] owner bootstrap skipped: ${bootstrap.reason}`)
+  }
+
   const app = createApp()
 
   const server = app.listen(env.PORT, "0.0.0.0", () => {
