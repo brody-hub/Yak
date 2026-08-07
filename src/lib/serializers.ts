@@ -28,13 +28,24 @@ export function fallbackAvatarUrl(seed: string): string {
   return `https://api.dicebear.com/9.x/avataaars/svg?${params.toString()}`
 }
 
-function avatarFor(row: Pick<User, "name" | "avatarImageId">): string {
+function avatarFor(
+  row: Pick<User, "name" | "image" | "avatarImageId">
+): string {
   if (row.avatarImageId) {
     const signed = signedImageUrl(row.avatarImageId, "avatar")
 
     if (signed) {
       return signed
     }
+  }
+
+  // Inline data URLs (or absolute URLs) stored when Cloudflare Images is not
+  // configured. Kept on the Better Auth `image` column.
+  if (
+    row.image &&
+    (row.image.startsWith("data:image/") || /^https?:\/\//.test(row.image))
+  ) {
+    return row.image
   }
 
   return fallbackAvatarUrl(row.name)

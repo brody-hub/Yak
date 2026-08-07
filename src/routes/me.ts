@@ -130,27 +130,81 @@ meRouter.post(
   }
 )
 
-/** Persists an avatar that the client already uploaded to Cloudflare Images. */
+const INLINE_AVATAR_MAX_CHARS = 350_000
+const INLINE_AVATAR_PATTERN =
+  /^data:image\/(jpeg|jpg|png|webp|gif);base64,[A-Za-z0-9+/]+=*$/
+
+/**
+ * Persists an avatar. Prefer a Cloudflare Images id when that integration is
+ * configured; otherwise the panel may send a small compressed data URL which
+ * we store on the Better Auth `image` column.
+ */
 meRouter.put(
   "/avatar",
   validate({
     body: z
-      .object({ imageId: z.string().trim().min(1).max(120).nullable() })
-      .strict(),
+      .object({
+        imageId: z.string().trim().min(1).max(120).nullable().optional(),
+        dataUrl: z.string().trim().min(1).max(INLINE_AVATAR_MAX_CHARS).nullable().optional(),
+      })
+      .strict()
+      .refine(
+        (body) =>
+          Object.prototype.hasOwnProperty.call(body, "imageId") ||
+          Object.prototype.hasOwnProperty.call(body, "dataUrl"),
+        { message: "Provide imageId or dataUrl" }
+      ),
   }),
   async (req, res) => {
     const { user } = getAuth(req)
-    const { imageId } = req.body as { imageId: string | null }
+    const body = req.body as {
+      imageId?: string | null
+      dataUrl?: string | null
+    }
 
-    // The client controls this value, so confirm the image really exists in
-    // our Cloudflare account before storing a reference to it.
-    if (imageId && !(await imageExists(imageId))) {
-      throw new BadRequestError("That image was not found or was never uploaded")
+    const patch: {
+      avatarImageId?: string | null
+      image?: string | null
+      updatedAt: Date
+    } = { updatedAt: new Date() }
+
+    let summary = "Removed avatar"
+
+    if (Object.prototype.hasOwnProperty.call(body, "dataUrl")) {
+      const dataUrl = body.dataUrl ?? null
+
+      if (dataUrl === null) {
+        patch.image = null
+        patch.avatarImageId = null
+      } else {
+        if (!INLINE_AVATAR_PATTERN.test(dataUrl)) {
+          throw new BadRequestError(
+            "Avatar must be a JPEG, PNG, WebP, or GIF data URL"
+          )
+        }
+
+        patch.image = dataUrl
+        // Prefer the inline asset over any previous Cloudflare reference.
+        patch.avatarImageId = null
+        summary = "Updated avatar"
+      }
+    } else {
+      const imageId = body.imageId ?? null
+
+      if (imageId && !(await imageExists(imageId))) {
+        throw new BadRequestError(
+          "That image was not found or was never uploaded"
+        )
+      }
+
+      patch.avatarImageId = imageId
+      patch.image = null
+      summary = imageId ? "Updated avatar" : "Removed avatar"
     }
 
     const [row] = await db
       .update(userTable)
-      .set({ avatarImageId: imageId, updatedAt: new Date() })
+      .set(patch)
       .where(eq(userTable.id, user.id))
       .returning()
 
@@ -162,7 +216,7 @@ meRouter.put(
       userId: user.id,
       action: "updated",
       section: "account",
-      summary: imageId ? "Updated avatar" : "Removed avatar",
+      summary,
       ipAddress: req.ip,
     })
 
