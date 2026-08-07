@@ -6,6 +6,7 @@ import { z } from "zod"
 import { auth } from "../auth/auth.js"
 import { db } from "../db/index.js"
 import { activityLog, user as userTable } from "../db/schema.js"
+import { appendAuthCookies } from "../lib/auth-cookies.js"
 import { BadRequestError, NotFoundError } from "../lib/errors.js"
 import { serializeActivity, serializeCurrentUser } from "../lib/serializers.js"
 import { getAuth } from "../middleware/auth.js"
@@ -96,15 +97,20 @@ meRouter.post(
       )
     }
 
-    await auth.api.changePassword({
+    // revokeOtherSessions deletes every session (including this one) and
+    // issues a replacement cookie. That Set-Cookie must reach the browser or
+    // the next authenticated call will 401 with the stale cookie.
+    const changed = await auth.api.changePassword({
       body: {
         currentPassword,
         newPassword,
-        // Any other session was established with the old credential.
         revokeOtherSessions: true,
       },
       headers: fromNodeHeaders(req.headers),
+      returnHeaders: true,
     })
+
+    appendAuthCookies(res, changed.headers)
 
     const [row] = await db
       .update(userTable)
@@ -178,6 +184,11 @@ meRouter.get("/activity", async (req, res) => {
 })
 
 meRouter.post("/logout", async (req, res) => {
-  await auth.api.signOut({ headers: fromNodeHeaders(req.headers) })
+  const signedOut = await auth.api.signOut({
+    headers: fromNodeHeaders(req.headers),
+    returnHeaders: true,
+  })
+
+  appendAuthCookies(res, signedOut.headers)
   res.json({ data: { ok: true } })
 })
