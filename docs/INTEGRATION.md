@@ -8,7 +8,7 @@ only for the admin UI.
 
 ## 1. Create an API key
 
-Sign in to the panel as an owner or admin, open **Settings → API keys**, and
+Sign in to the panel as an owner or admin, open **Settings → Integrations**, and
 create a key with the scopes you need.
 
 | Scope | Grants |
