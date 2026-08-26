@@ -112,6 +112,11 @@ export const webhookDeliveryStatusEnum = pgEnum("webhook_delivery_status", [
   "failed",
 ])
 
+/** Third party analytics/billing providers Stand can read metrics from. */
+export const integrationProviderEnum = pgEnum("integration_provider", [
+  "revenuecat",
+])
+
 /* -------------------------------------------------------------------------- */
 /* Better Auth core tables                                                     */
 /*                                                                             */
@@ -606,6 +611,61 @@ export const webhookDeliveries = pgTable(
 )
 
 /* -------------------------------------------------------------------------- */
+/* Provider integrations: outbound API keys Stand uses to read metrics         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One row per connected provider. The credential is write-only: it is stored as
+ * AES-256-GCM ciphertext and only ever decrypted server side to call the
+ * provider's API, so the panel can display connection state without ever
+ * handing the key back to a browser.
+ */
+export const providerIntegrations = pgTable("provider_integrations", {
+  provider: integrationProviderEnum("provider").primaryKey(),
+  apiKeyEncrypted: text("api_key_encrypted").notNull(),
+  /** Non secret fragment shown in the UI, e.g. `sk_ab…9f21`. */
+  apiKeyHint: text("api_key_hint").notNull(),
+  /** Provider side scope the key resolved to, e.g. a RevenueCat project id. */
+  externalId: text("external_id"),
+  externalName: text("external_name"),
+  lastCheckedAt: timestamp("last_checked_at", { withTimezone: true }),
+  lastError: text("last_error"),
+  connectedByUserId: text("connected_by_user_id").references(() => user.id, {
+    onDelete: "set null",
+  }),
+  connectedAt: timestamp("connected_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+})
+
+/* -------------------------------------------------------------------------- */
+/* Dashboard: per user widget layout                                           */
+/* -------------------------------------------------------------------------- */
+
+export type DashboardWidgetConfig = {
+  /** Instance id, so the same widget type can be added more than once. */
+  id: string
+  type: string
+  options: Record<string, string | number | boolean>
+}
+
+export const dashboardLayouts = pgTable("dashboard_layouts", {
+  userId: text("user_id")
+    .primaryKey()
+    .references(() => user.id, { onDelete: "cascade" }),
+  widgets: jsonb("widgets")
+    .$type<DashboardWidgetConfig[]>()
+    .notNull()
+    .default([]),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+})
+
+/* -------------------------------------------------------------------------- */
 /* Inferred types                                                              */
 /* -------------------------------------------------------------------------- */
 
@@ -623,3 +683,5 @@ export type ApiKey = typeof apiKeys.$inferSelect
 export type AppSettings = typeof appSettings.$inferSelect
 export type DiscordTrigger = typeof discordTriggers.$inferSelect
 export type WebhookEndpoint = typeof webhookEndpoints.$inferSelect
+export type ProviderIntegration = typeof providerIntegrations.$inferSelect
+export type DashboardLayout = typeof dashboardLayouts.$inferSelect

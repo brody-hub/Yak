@@ -12,7 +12,10 @@ import { activityRouter } from "./activity.js"
 import { analyticsRouter } from "./analytics.js"
 import { apiKeysRouter } from "./api-keys.js"
 import { appUsersRouter } from "./app-users.js"
+import { dashboardRouter } from "./dashboard.js"
 import { discordRouter } from "./discord.js"
+import { integrationsRouter } from "./integrations.js"
+import { kpisRouter } from "./kpis.js"
 import { meRouter } from "./me.js"
 import { mediaRouter } from "./media.js"
 import { publicEventsRouter } from "./public/events.js"
@@ -60,9 +63,19 @@ panel.use("/activity", requirePermission("user-management"), activityRouter)
 panel.use("/tasks", requirePermission("tasks"), tasksRouter)
 panel.use("/reports", requirePermission("reports"), reportsRouter)
 panel.use("/analytics", requirePermission("analytics"), analyticsRouter)
+panel.use("/kpis", requirePermission("kpis"), kpisRouter)
 panel.use("/app-users", requirePermission("users"), appUsersRouter)
 panel.use("/settings", requirePermission("theme"), settingsRouter)
 panel.use("/discord", requirePermission("discord"), discordRouter)
+
+// A user only ever reads and writes their own layout, so no section gate: the
+// widgets themselves read from endpoints that are already permission checked.
+panel.use("/dashboard", dashboardRouter)
+
+// Reading connection state is open to every signed-in user because the
+// dashboard needs it to decide which widgets can be offered. Writing a
+// credential is gated inside the router on the owner/admin role.
+panel.use("/integrations", integrationsRouter)
 
 panel.use("/api-keys", requireApiKeyManagement, apiKeysRouter)
 panel.use("/webhook-endpoints", requireApiKeyManagement, webhookEndpointsRouter)

@@ -1,4 +1,4 @@
-import { asc, desc, eq, ilike, or } from "drizzle-orm"
+import { asc, count, desc, eq, gte, ilike, or } from "drizzle-orm"
 import { Router } from "express"
 import { z } from "zod"
 
@@ -48,6 +48,65 @@ appUsersRouter.get(
       .limit(limit)
 
     res.json({ data: rows.map(serializeAppUser) })
+  }
+)
+
+/**
+ * Roster totals for the dashboard.
+ *
+ * Declared before `/:externalId` so the literal path is not captured by the
+ * parameterised route.
+ */
+appUsersRouter.get(
+  "/stats",
+  validate({
+    query: z.object({
+      days: z.coerce.number().int().min(1).max(90).default(7),
+    }),
+  }),
+  async (req, res) => {
+    const { days } = validatedQuery<{ days: number }>(req)
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
+
+    const byStatus = await db
+      .select({ status: appUsers.status, total: count() })
+      .from(appUsers)
+      .groupBy(appUsers.status)
+
+    const byPlan = await db
+      .select({ plan: appUsers.plan, total: count() })
+      .from(appUsers)
+      .groupBy(appUsers.plan)
+
+    const [recent] = await db
+      .select({ total: count() })
+      .from(appUsers)
+      .where(gte(appUsers.createdAt, since))
+
+    const statusTotals = { active: 0, trialing: 0, churned: 0 }
+    let total = 0
+
+    for (const row of byStatus) {
+      statusTotals[row.status] = Number(row.total)
+      total += Number(row.total)
+    }
+
+    const planTotals = { free: 0, plus: 0, pro: 0 }
+
+    for (const row of byPlan) {
+      planTotals[row.plan] = Number(row.total)
+    }
+
+    res.json({
+      data: {
+        windowDays: days,
+        total,
+        ...statusTotals,
+        paid: planTotals.plus + planTotals.pro,
+        plans: planTotals,
+        newInWindow: Number(recent?.total ?? 0),
+      },
+    })
   }
 )
 

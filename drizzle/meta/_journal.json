@@ -8,6 +8,13 @@
       "when": 1786063853905,
       "tag": "0000_init",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1787725646272,
+      "tag": "0001_supreme_shadow_king",
+      "breakpoints": true
     }
   ]
 }
