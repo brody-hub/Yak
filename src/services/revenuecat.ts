@@ -111,7 +111,7 @@ async function revenueCatRequest<T>(
 
   if (response.status === 401 || response.status === 403) {
     throw new BadRequestError(
-      "RevenueCat rejected the API key. Check that it is a secret v2 key with read access to metrics."
+      "RevenueCat rejected the API key. Use a secret v2 key with every Read permission enabled, and no Write permissions."
     )
   }
 
