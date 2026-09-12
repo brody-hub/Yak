@@ -109,22 +109,47 @@ kpisRouter.get(
 
     if (!credential) {
       res.json({
-        data: { connected: false, available: false, chart, points: [] },
+        data: {
+          connected: false,
+          available: false,
+          reason: null,
+          message: null,
+          chart,
+          resolution: null,
+          points: [],
+        },
       })
       return
     }
 
-    const series = await fetchChart(credential, chart, days)
+    const result = await fetchChart(credential, chart, days)
+
+    if (!result.ok) {
+      // The tile shows `message` verbatim, so it names the actual cause
+      // (permission, rate limit, upstream error) rather than guessing.
+      res.json({
+        data: {
+          connected: true,
+          available: false,
+          reason: result.failure.reason,
+          message: result.failure.message,
+          chart,
+          resolution: null,
+          points: [],
+        },
+      })
+      return
+    }
 
     res.json({
       data: {
         connected: true,
-        // False when the project's plan does not expose chart data; the tile
-        // then explains why it is empty instead of showing a flat line.
-        available: series !== null,
+        available: true,
+        reason: null,
+        message: null,
         chart,
-        resolution: series?.resolution ?? null,
-        points: series?.points ?? [],
+        resolution: result.series.resolution,
+        points: result.series.points,
       },
     })
   }

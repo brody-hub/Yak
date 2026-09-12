@@ -14,18 +14,28 @@ const API_BASE = "https://api.revenuecat.com/v2"
 const REQUEST_TIMEOUT_MS = 10_000
 
 /**
- * RevenueCat allows 25 requests per minute against the Charts & Metrics
- * endpoints, which is easily exceeded by a dashboard several people have open.
- * Responses are cached in process for a minute; subscription metrics only
- * refresh on RevenueCat's side every few minutes anyway.
+ * RevenueCat allows 25 requests per minute against the whole Charts & Metrics
+ * domain, which a dashboard with a handful of trend tiles open in a few
+ * browsers exceeds quickly. Responses are cached in process: the overview for
+ * a minute, and chart series for five, since RevenueCat itself only recomputes
+ * charts every few minutes.
+ *
+ * Every call here is a read. Nothing in this module ever writes to RevenueCat.
  */
-const CACHE_TTL_MS = 60_000
+const OVERVIEW_CACHE_TTL_MS = 60_000
+const CHART_CACHE_TTL_MS = 5 * 60_000
+/** A failed chart read is remembered briefly so a broken tile does not retry on every render. */
+const CHART_FAILURE_TTL_MS = 60_000
 
 type CacheEntry = { expiresAt: number; value: unknown }
 
 const cache = new Map<string, CacheEntry>()
 
-function cached<T>(key: string, load: () => Promise<T>): Promise<T> {
+function cached<T>(
+  key: string,
+  ttlMs: number,
+  load: () => Promise<T>
+): Promise<T> {
   const hit = cache.get(key)
 
   if (hit && hit.expiresAt > Date.now()) {
@@ -33,7 +43,7 @@ function cached<T>(key: string, load: () => Promise<T>): Promise<T> {
   }
 
   return load().then((value) => {
-    cache.set(key, { expiresAt: Date.now() + CACHE_TTL_MS, value })
+    cache.set(key, { expiresAt: Date.now() + ttlMs, value })
     return value
   })
 }
@@ -81,7 +91,29 @@ export async function loadRevenueCatCredential(): Promise<RevenueCatCredential |
 /* HTTP                                                                       */
 /* -------------------------------------------------------------------------- */
 
-async function revenueCatRequest<T>(
+/** A non-2xx reply from RevenueCat, with the status kept so callers can tell a permission problem from a bad request. */
+class RevenueCatHttpError extends Error {
+  readonly status: number
+  readonly body: string
+
+  constructor(status: number, body: string) {
+    super(`RevenueCat responded ${status}`)
+    this.name = "RevenueCatHttpError"
+    this.status = status
+    this.body = body
+  }
+}
+
+/** A network failure or timeout before RevenueCat answered. */
+class RevenueCatNetworkError extends Error {
+  constructor(cause: unknown) {
+    super("Could not reach RevenueCat", { cause })
+    this.name = "RevenueCatNetworkError"
+  }
+}
+
+/** GET only. This client has no way to send a body or a mutating verb. */
+async function rawRequest<T>(
   apiKey: string,
   path: string,
   query?: Record<string, string | number | undefined>
@@ -98,6 +130,7 @@ async function revenueCatRequest<T>(
 
   try {
     response = await fetch(url, {
+      method: "GET",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         Accept: "application/json",
@@ -106,36 +139,59 @@ async function revenueCatRequest<T>(
     })
   } catch (error) {
     logger.warn({ err: error, path }, "RevenueCat request failed")
-    throw new ServiceUnavailableError("Could not reach RevenueCat")
-  }
-
-  if (response.status === 401 || response.status === 403) {
-    throw new BadRequestError(
-      "RevenueCat rejected the API key. Use a secret v2 key with every Read permission enabled, and no Write permissions."
-    )
-  }
-
-  if (response.status === 404) {
-    throw new BadRequestError(
-      "RevenueCat could not find that project. Reconnect the integration to pick it up again."
-    )
-  }
-
-  if (response.status === 429) {
-    throw new RateLimitError(
-      "RevenueCat is rate limiting this project. Try again in a minute."
-    )
+    throw new RevenueCatNetworkError(error)
   }
 
   if (!response.ok) {
+    // The body is kept short: it is only ever logged, never returned.
+    const body = (await response.text().catch(() => "")).slice(0, 500)
+    throw new RevenueCatHttpError(response.status, body)
+  }
+
+  return (await response.json()) as T
+}
+
+/** Same request, with failures turned into the panel's error envelope. */
+async function revenueCatRequest<T>(
+  apiKey: string,
+  path: string,
+  query?: Record<string, string | number | undefined>
+): Promise<T> {
+  try {
+    return await rawRequest<T>(apiKey, path, query)
+  } catch (error) {
+    if (error instanceof RevenueCatNetworkError) {
+      throw new ServiceUnavailableError("Could not reach RevenueCat")
+    }
+
+    if (!(error instanceof RevenueCatHttpError)) {
+      throw error
+    }
+
+    if (error.status === 401 || error.status === 403) {
+      throw new BadRequestError(
+        "RevenueCat rejected the API key. Use a secret v2 key with every Read permission enabled, and no Write permissions."
+      )
+    }
+
+    if (error.status === 404) {
+      throw new BadRequestError(
+        "RevenueCat could not find that project. Reconnect the integration to pick it up again."
+      )
+    }
+
+    if (error.status === 429) {
+      throw new RateLimitError(
+        "RevenueCat is rate limiting this project. Try again in a minute."
+      )
+    }
+
     logger.warn(
-      { status: response.status, path },
+      { status: error.status, path, body: error.body },
       "Unexpected RevenueCat response"
     )
     throw new ServiceUnavailableError("RevenueCat returned an unexpected error")
   }
-
-  return (await response.json()) as T
 }
 
 /* -------------------------------------------------------------------------- */
@@ -254,7 +310,7 @@ export type RevenueCatOverview = {
 export async function fetchOverview(
   credential: RevenueCatCredential
 ): Promise<RevenueCatOverview> {
-  return cached(`overview:${credential.projectId}`, async () => {
+  return cached(`overview:${credential.projectId}`, OVERVIEW_CACHE_TTL_MS, async () => {
     const response = await revenueCatRequest<OverviewResponse>(
       credential.apiKey,
       `/projects/${encodeURIComponent(credential.projectId)}/metrics/overview`
@@ -286,6 +342,10 @@ export async function fetchOverview(
 /* Charts (time series)                                                        */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Chart ids the panel uses. They are stored in saved dashboard layouts, so
+ * they stay stable and are mapped to RevenueCat's own chart names below.
+ */
 export const REVENUECAT_CHARTS = [
   "revenue",
   "mrr",
@@ -298,71 +358,274 @@ export const REVENUECAT_CHARTS = [
 
 export type RevenueCatChartName = (typeof REVENUECAT_CHARTS)[number]
 
+/**
+ * RevenueCat's chart identifiers, as listed by the v2 Charts & Metrics
+ * reference. Only `revenue` and `mrr` share a name with the panel's id.
+ */
+const REVENUECAT_CHART_IDS: Record<RevenueCatChartName, string> = {
+  revenue: "revenue",
+  mrr: "mrr",
+  active_subscriptions: "actives",
+  new_customers: "customers_new",
+  active_trials: "trials",
+  trials_conversion: "trial_conversion_rate",
+  churned_subscriptions: "churn",
+}
+
 export function isRevenueCatChart(value: string): value is RevenueCatChartName {
   return (REVENUECAT_CHARTS as readonly string[]).includes(value)
 }
 
+export type RevenueCatResolution = "day" | "week" | "month"
+
 export type RevenueCatSeries = {
   chart: RevenueCatChartName
-  resolution: "day" | "week" | "month"
+  resolution: RevenueCatResolution
   points: { date: string; value: number }[]
 }
 
+/**
+ * Why a chart could not be read. Reported to the panel so a tile can say
+ * something true instead of guessing.
+ *
+ * - `permission`: the key works for the overview but lacks
+ *   `charts_metrics:charts:read`.
+ * - `rate_limited`: RevenueCat's 25 requests per minute budget is spent.
+ * - `unavailable`: RevenueCat answered, but not with a series we could read.
+ * - `unreachable`: network failure or timeout.
+ */
+export type RevenueCatChartFailure = {
+  reason: "permission" | "rate_limited" | "unavailable" | "unreachable"
+  message: string
+}
+
+export type RevenueCatChartResult =
+  | { ok: true; series: RevenueCatSeries }
+  | { ok: false; failure: RevenueCatChartFailure }
+
+/**
+ * Chart responses carry several measures per period (for example revenue plus
+ * a transaction count). Measure 0 is the headline series on every chart.
+ */
+const PRIMARY_MEASURE = 0
+
+type ChartPoint = {
+  cohort?: number | string
+  period?: string
+  date?: string
+  measure?: number
+  value?: number | string | null
+  incomplete?: boolean
+}
+
 type ChartResponse = {
-  values?: { period?: string; date?: string; value?: number | null }[]
-  data?: { period?: string; date?: string; value?: number | null }[]
+  object?: string
+  resolution?: string
+  /**
+   * Documented as an array of arrays; observed as a flat array of points.
+   * Both shapes are accepted, plus `data` in case the field is renamed.
+   */
+  values?: unknown
+  data?: unknown
+}
+
+function formatDate(value: Date): string {
+  return value.toISOString().slice(0, 10)
+}
+
+function pointDate(raw: unknown): string | null {
+  // Unix seconds (observed) or milliseconds, just in case.
+  if (typeof raw === "number" && Number.isFinite(raw)) {
+    const ms = raw > 1e12 ? raw : raw * 1000
+    return formatDate(new Date(ms))
+  }
+
+  if (typeof raw === "string" && raw.length >= 10) {
+    // Either a plain date or a full timestamp; both start with YYYY-MM-DD.
+    return /^\d{4}-\d{2}-\d{2}/.test(raw) ? raw.slice(0, 10) : null
+  }
+
+  return null
+}
+
+function pointValue(raw: unknown): number | null {
+  if (raw === null || raw === undefined) {
+    return null
+  }
+
+  const value = Number(raw)
+  return Number.isFinite(value) ? value : null
+}
+
+/**
+ * Flattens whatever RevenueCat put under `values` into date/value pairs for the
+ * primary measure, summing duplicates so a segmented response still charts as
+ * one line.
+ */
+function parseChartPoints(response: ChartResponse): { date: string; value: number }[] {
+  const raw = response.values ?? response.data
+
+  if (!Array.isArray(raw)) {
+    return []
+  }
+
+  // Nested arrays are one series per segment; flat arrays are one series.
+  const entries: unknown[] = raw.flatMap((entry) =>
+    Array.isArray(entry) && entry.some((item) => typeof item === "object")
+      ? entry
+      : [entry]
+  )
+
+  const totals = new Map<string, number>()
+
+  for (const entry of entries) {
+    let date: string | null = null
+    let value: number | null = null
+
+    if (Array.isArray(entry)) {
+      // Tuple form: [period, value].
+      date = pointDate(entry[0])
+      value = pointValue(entry[1])
+    } else if (entry && typeof entry === "object") {
+      const point = entry as ChartPoint
+
+      if (point.measure !== undefined && point.measure !== PRIMARY_MEASURE) {
+        continue
+      }
+
+      date = pointDate(point.cohort ?? point.period ?? point.date)
+      value = pointValue(point.value)
+    }
+
+    if (date === null || value === null) {
+      continue
+    }
+
+    totals.set(date, (totals.get(date) ?? 0) + value)
+  }
+
+  return [...totals.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([date, value]) => ({ date, value }))
 }
 
 /**
  * Time series for one RevenueCat chart.
  *
- * The charts API is less stable than the overview endpoint and is not available
- * on every plan, so callers get `null` instead of an exception when it cannot be
- * read; trend tiles then render an explanatory empty state rather than failing
- * the whole dashboard.
+ * Reads `GET /projects/{id}/charts/{chart}` with `start_date`, `end_date`
+ * (YYYY-MM-DD) and `resolution`, which is the documented contract. Failures are
+ * returned rather than thrown so one broken tile never takes down a dashboard,
+ * but each failure carries its real cause: a permission gap, a rate limit, an
+ * unreadable reply, or a network problem.
  */
 export async function fetchChart(
   credential: RevenueCatCredential,
   chart: RevenueCatChartName,
   days: number
-): Promise<RevenueCatSeries | null> {
-  const resolution = days > 90 ? "month" : days > 31 ? "week" : "day"
+): Promise<RevenueCatChartResult> {
+  const resolution: RevenueCatResolution =
+    days > 90 ? "month" : days > 31 ? "week" : "day"
   const key = `chart:${credential.projectId}:${chart}:${days}`
+  const hit = cache.get(key)
 
-  return cached(key, async () => {
-    const end = new Date()
-    const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000)
+  if (hit && hit.expiresAt > Date.now()) {
+    return hit.value as RevenueCatChartResult
+  }
 
-    try {
-      const response = await revenueCatRequest<ChartResponse>(
-        credential.apiKey,
-        `/projects/${encodeURIComponent(credential.projectId)}/charts/${chart}`,
-        {
-          resolution,
-          start_time: start.toISOString(),
-          end_time: end.toISOString(),
-        }
-      )
+  const result = await loadChart(credential, chart, days, resolution)
 
-      const rows = response.values ?? response.data ?? []
-
-      return {
-        chart,
-        resolution,
-        points: rows.flatMap((row) => {
-          const date = row.period ?? row.date
-
-          return date
-            ? [{ date: date.slice(0, 10), value: Number(row.value ?? 0) }]
-            : []
-        }),
-      } satisfies RevenueCatSeries
-    } catch (error) {
-      logger.info(
-        { err: error, chart },
-        "RevenueCat chart data is unavailable for this project"
-      )
-      return null
-    }
+  cache.set(key, {
+    value: result,
+    expiresAt: Date.now() + (result.ok ? CHART_CACHE_TTL_MS : CHART_FAILURE_TTL_MS),
   })
+
+  return result
+}
+
+async function loadChart(
+  credential: RevenueCatCredential,
+  chart: RevenueCatChartName,
+  days: number,
+  resolution: RevenueCatResolution
+): Promise<RevenueCatChartResult> {
+  const end = new Date()
+  const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000)
+  const remoteChart = REVENUECAT_CHART_IDS[chart]
+  const path = `/projects/${encodeURIComponent(credential.projectId)}/charts/${remoteChart}`
+
+  let response: ChartResponse
+
+  try {
+    response = await rawRequest<ChartResponse>(credential.apiKey, path, {
+      resolution,
+      start_date: formatDate(start),
+      end_date: formatDate(end),
+    })
+  } catch (error) {
+    return { ok: false, failure: describeChartError(error, chart) }
+  }
+
+  const points = parseChartPoints(response)
+
+  if (points.length === 0) {
+    // Either genuinely empty or a shape we do not understand. The top level
+    // keys are logged so the difference is visible in production logs.
+    logger.info(
+      {
+        chart: remoteChart,
+        resolution,
+        keys: Object.keys(response ?? {}),
+        valuesType: Array.isArray(response?.values)
+          ? `array(${(response.values as unknown[]).length})`
+          : typeof response?.values,
+      },
+      "RevenueCat chart returned no readable points"
+    )
+  }
+
+  return { ok: true, series: { chart, resolution, points } }
+}
+
+function describeChartError(
+  error: unknown,
+  chart: RevenueCatChartName
+): RevenueCatChartFailure {
+  if (error instanceof RevenueCatNetworkError) {
+    return { reason: "unreachable", message: "Could not reach RevenueCat." }
+  }
+
+  if (error instanceof RevenueCatHttpError) {
+    logger.warn(
+      { status: error.status, chart, body: error.body },
+      "RevenueCat chart request failed"
+    )
+
+    if (error.status === 401 || error.status === 403) {
+      return {
+        reason: "permission",
+        message:
+          "The RevenueCat key cannot read charts. Grant the Charts & Metrics read permission (charts_metrics:charts:read) to the key in RevenueCat, then reconnect it in Settings → Integrations.",
+      }
+    }
+
+    if (error.status === 429) {
+      return {
+        reason: "rate_limited",
+        message:
+          "RevenueCat is rate limiting chart requests. This tile will retry in a minute.",
+      }
+    }
+
+    return {
+      reason: "unavailable",
+      message: `RevenueCat did not return this chart (HTTP ${error.status}).`,
+    }
+  }
+
+  logger.warn({ err: error, chart }, "RevenueCat chart read failed")
+
+  return {
+    reason: "unavailable",
+    message: "RevenueCat did not return this chart.",
+  }
 }

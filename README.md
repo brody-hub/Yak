@@ -17,9 +17,12 @@ One deployed instance serves exactly one customer application.
 | Discord | Fires configured Discord webhooks on four panel triggers. |
 | Email | Invites and password resets through Cloudflare Email Service. |
 | Media | Avatars and branding logos in Cloudflare R2 with presigned URLs. |
+| KPIs | Read-only subscription metrics and charts from a connected RevenueCat project. |
+| Dashboard | Per-user widget layout for the panel home page. |
 
-Dashboard and KPI data stay as frontend demo data and are deliberately not
-backed by this service yet.
+RevenueCat is only ever read. The panel stores one secret key (encrypted) and
+issues GET requests against the v2 Charts & Metrics API; nothing here writes
+to, or alters, RevenueCat data.
 
 ## Local setup
 

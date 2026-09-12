@@ -111,9 +111,33 @@ Requires the `reports` permission.
 
 Internal messages are excluded from everything the reporter can read.
 
-## Analytics (`/api/analytics`)
+## KPIs (`/api/kpis`)
 
-Requires the `analytics` permission. `days` defaults to 7, maximum 90.
+Requires the `kpis` permission. Everything is read from the connected
+RevenueCat project and cached in process (overview one minute, charts five
+minutes) to stay inside RevenueCat's 25 requests per minute budget. Nothing
+here writes to RevenueCat.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/overview` | Snapshot metrics plus a derived summary. `connected: false` with empty metrics when RevenueCat is not set up. |
+| GET | `/trend?chart=&days=` | Time series for one chart. `days` 7 to 365; resolution is day, week, or month by window. |
+| GET | `/charts` | Chart ids the trend endpoint accepts, with labels. |
+
+Trend responses carry `available`. When it is false, `reason` is one of
+`permission` (the key lacks `charts_metrics:charts:read`), `rate_limited`,
+`unavailable` (RevenueCat answered without a readable series), or
+`unreachable`, and `message` explains it in words the panel shows verbatim.
+
+Chart ids are the panel's own (`active_subscriptions`, `new_customers`, …) and
+are mapped to RevenueCat's chart names (`actives`, `customers_new`, …) on the
+server so saved dashboard layouts stay stable.
+
+## Analytic Events (`/api/analytics`)
+
+Requires the `analytics` permission. `days` defaults to 7, maximum 90. These
+are events the customer application sends through the ingest API, not
+RevenueCat data.
 
 | Method | Path | Description |
 | --- | --- | --- |
