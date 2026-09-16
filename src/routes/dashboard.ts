@@ -21,6 +21,21 @@ export const dashboardRouter: Router = Router()
  */
 
 const MAX_WIDGETS = 24
+/** Columns on the panel's board. Widths and x positions are bounded by it. */
+const GRID_COLS = 12
+/** Generous ceiling so a corrupt client cannot store a mile-tall layout. */
+const MAX_ROWS = 400
+
+const layoutSchema = z
+  .object({
+    x: z.number().int().min(0).max(GRID_COLS - 1),
+    y: z.number().int().min(0).max(MAX_ROWS),
+    w: z.number().int().min(1).max(GRID_COLS),
+    h: z.number().int().min(1).max(MAX_ROWS),
+  })
+  .refine((layout) => layout.x + layout.w <= GRID_COLS, {
+    message: "Widget runs past the right edge of the board",
+  })
 
 const widgetSchema = z.object({
   id: z.string().trim().min(1).max(64),
@@ -31,6 +46,7 @@ const widgetSchema = z.object({
       z.union([z.string().max(120), z.number(), z.boolean()])
     )
     .default({}),
+  layout: layoutSchema.optional(),
 })
 
 dashboardRouter.get("/layout", async (req, res) => {

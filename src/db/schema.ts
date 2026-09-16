@@ -650,6 +650,11 @@ export type DashboardWidgetConfig = {
   id: string
   type: string
   options: Record<string, string | number | boolean>
+  /**
+   * Cell rectangle on the panel's 12 column board. Absent on layouts saved
+   * before the board existed; the panel places those on load.
+   */
+  layout?: { x: number; y: number; w: number; h: number }
 }
 
 export const dashboardLayouts = pgTable("dashboard_layouts", {

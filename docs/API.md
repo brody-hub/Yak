@@ -133,6 +133,18 @@ Chart ids are the panel's own (`active_subscriptions`, `new_customers`, …) and
 are mapped to RevenueCat's chart names (`actives`, `customers_new`, …) on the
 server so saved dashboard layouts stay stable.
 
+## Dashboard (`/api/dashboard`)
+
+Any signed-in user. The layout is per user.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/layout` | `{ widgets, updatedAt }`. `widgets` is null until the user saves a layout. |
+| PUT | `/layout` | `{ widgets: [{ id, type, options, layout? }] }`, at most 24. Replaces the layout. |
+
+`layout` is `{ x, y, w, h }` in cells on a 12 column board. Widget types and
+option keys are defined by the panel; the server only checks shape and size.
+
 ## Analytic Events (`/api/analytics`)
 
 Requires the `analytics` permission. `days` defaults to 7, maximum 90. These
