@@ -39,9 +39,12 @@ const eventSchema = z.object({
 const MAX_BATCH = 200
 const MAX_CLOCK_SKEW_MS = 24 * 60 * 60 * 1000
 
-function resolveOccurredAt(timestamp: Date | undefined, now: Date): Date {
+function resolveOccurredAt(
+  timestamp: Date | undefined,
+  now: Date
+): { occurredAt: Date; clamped: boolean } {
   if (!timestamp) {
-    return now
+    return { occurredAt: now, clamped: false }
   }
 
   const drift = timestamp.getTime() - now.getTime()
@@ -49,10 +52,10 @@ function resolveOccurredAt(timestamp: Date | undefined, now: Date): Date {
   // Anything more than a day in the future, or older than 30 days, is treated
   // as an unreliable client clock and clamped to receipt time.
   if (drift > MAX_CLOCK_SKEW_MS || drift < -30 * 24 * 60 * 60 * 1000) {
-    return now
+    return { occurredAt: now, clamped: true }
   }
 
-  return timestamp
+  return { occurredAt: timestamp, clamped: false }
 }
 
 /**
@@ -61,6 +64,10 @@ function resolveOccurredAt(timestamp: Date | undefined, now: Date): Date {
  * Ingest is intentionally forgiving in shape but strict in validation: one bad
  * event in a batch fails the whole request so the client can correct and retry
  * rather than silently losing data.
+ *
+ * An implausible timestamp is the exception. Rejecting it would fail the whole
+ * batch on every retry because of one device's clock, so the event is kept at
+ * receipt time and the response says how many were adjusted.
  */
 publicEventsRouter.post(
   "/",
@@ -85,24 +92,33 @@ publicEventsRouter.post(
     }
 
     const now = new Date()
+    let clamped = 0
 
-    const rows = events.map((event) => ({
-      id: newId(),
-      name: event.name,
-      externalUserId: event.userId ?? null,
-      userName: event.userName ?? null,
-      anonymousId: event.anonymousId ?? null,
-      sessionId: event.sessionId ?? null,
-      platform: event.platform ?? null,
-      appVersion: event.appVersion ?? null,
-      properties: event.properties,
-      apiKeyId: apiKey.id,
-      occurredAt: resolveOccurredAt(event.timestamp, now),
-      receivedAt: now,
-    }))
+    const rows = events.map((event) => {
+      const resolved = resolveOccurredAt(event.timestamp, now)
+
+      if (resolved.clamped) {
+        clamped += 1
+      }
+
+      return {
+        id: newId(),
+        name: event.name,
+        externalUserId: event.userId ?? null,
+        userName: event.userName ?? null,
+        anonymousId: event.anonymousId ?? null,
+        sessionId: event.sessionId ?? null,
+        platform: event.platform ?? null,
+        appVersion: event.appVersion ?? null,
+        properties: event.properties,
+        apiKeyId: apiKey.id,
+        occurredAt: resolved.occurredAt,
+        receivedAt: now,
+      }
+    })
 
     await db.insert(analyticsEvents).values(rows)
 
-    res.status(202).json({ data: { accepted: rows.length } })
+    res.status(202).json({ data: { accepted: rows.length, clamped } })
   }
 )

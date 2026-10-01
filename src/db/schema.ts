@@ -85,8 +85,6 @@ export const messageAuthorTypeEnum = pgEnum("message_author_type", [
 
 export const platformEnum = pgEnum("platform", ["ios", "android", "web"])
 
-export const appUserPlanEnum = pgEnum("app_user_plan", ["free", "plus", "pro"])
-
 export const appUserBillingPeriodEnum = pgEnum("app_user_billing_period", [
   "none",
   "monthly",
@@ -361,15 +359,19 @@ export const reports = pgTable(
 
     // Reporter identity as supplied by the integrating application.
     reporterName: text("reporter_name").notNull(),
-    reporterEmail: text("reporter_email").notNull(),
+    // Null when the app has no address for the reporter (phone sign-in).
+    reporterEmail: text("reporter_email"),
     externalUserId: text("external_user_id"),
 
-    platform: platformEnum("platform").notNull().default("web"),
+    // Null when the app did not say; never guessed.
+    platform: platformEnum("platform"),
     appVersion: text("app_version"),
     metadata: jsonb("metadata").$type<Record<string, unknown>>(),
 
     source: reportSourceEnum("source").notNull().default("api"),
     apiKeyId: text("api_key_id"),
+    // Supplied by the integrator so a retried create returns the first report.
+    idempotencyKey: text("idempotency_key"),
     assigneeId: text("assignee_id").references(() => user.id, {
       onDelete: "set null",
     }),
@@ -392,6 +394,8 @@ export const reports = pgTable(
     index("reports_assignee_id_idx").on(table.assigneeId),
     index("reports_reporter_email_idx").on(table.reporterEmail),
     index("reports_updated_at_idx").on(table.updatedAt),
+    index("reports_external_user_id_idx").on(table.externalUserId),
+    uniqueIndex("reports_idempotency_key_idx").on(table.idempotencyKey),
   ]
 )
 
@@ -470,13 +474,16 @@ export const appUsers = pgTable(
     id: text("id").primaryKey(),
     externalId: text("external_id").notNull(),
     name: text("name").notNull(),
-    email: text("email").notNull(),
+    // Null for accounts with no address on file (phone sign-in).
+    email: text("email"),
     avatarUrl: text("avatar_url"),
-    plan: appUserPlanEnum("plan").notNull().default("free"),
+    // The integrating app's own plan name, lowercased. `free` means unpaid.
+    plan: text("plan").notNull().default("free"),
     billingPeriod: appUserBillingPeriodEnum("billing_period")
       .notNull()
       .default("none"),
-    platform: platformEnum("platform").notNull().default("web"),
+    // Null when the app did not say; never guessed.
+    platform: platformEnum("platform"),
     status: appUserStatusEnum("status").notNull().default("active"),
     renewsAt: timestamp("renews_at", { withTimezone: true }),
     metadata: jsonb("metadata").$type<Record<string, unknown>>(),
@@ -513,6 +520,9 @@ export const apiKeys = pgTable(
     }),
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
     lastUsedIp: text("last_used_ip"),
+    /** Most recent rejected request, so a failing integration is visible. */
+    lastErrorAt: timestamp("last_error_at", { withTimezone: true }),
+    lastError: text("last_error"),
     expiresAt: timestamp("expires_at", { withTimezone: true }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true })

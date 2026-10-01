@@ -303,6 +303,22 @@ export type RevenueCatOverview = {
 }
 
 /**
+ * Stamps the connection with the outcome of a real read, so "last checked" on
+ * the settings page follows actual use instead of the last time someone
+ * pressed Test. The overview is cached for a minute, so this writes at most
+ * once a minute however many tiles are open.
+ */
+function recordConnectionCheck(error: string | null): void {
+  void db
+    .update(providerIntegrations)
+    .set({ lastCheckedAt: new Date(), lastError: error })
+    .where(eq(providerIntegrations.provider, "revenuecat"))
+    .catch((cause: unknown) => {
+      logger.warn({ err: cause }, "Could not record the RevenueCat check")
+    })
+}
+
+/**
  * The one call that backs every KPI tile: RevenueCat returns its whole overview
  * panel in a single response, so individual chart endpoints are never needed
  * just to fill in a stat card.
@@ -311,10 +327,21 @@ export async function fetchOverview(
   credential: RevenueCatCredential
 ): Promise<RevenueCatOverview> {
   return cached(`overview:${credential.projectId}`, OVERVIEW_CACHE_TTL_MS, async () => {
-    const response = await revenueCatRequest<OverviewResponse>(
-      credential.apiKey,
-      `/projects/${encodeURIComponent(credential.projectId)}/metrics/overview`
-    )
+    let response: OverviewResponse
+
+    try {
+      response = await revenueCatRequest<OverviewResponse>(
+        credential.apiKey,
+        `/projects/${encodeURIComponent(credential.projectId)}/metrics/overview`
+      )
+    } catch (error) {
+      recordConnectionCheck(
+        error instanceof Error ? error.message : "RevenueCat check failed"
+      )
+      throw error
+    }
+
+    recordConnectionCheck(null)
 
     return {
       currency: response.currency ?? "USD",

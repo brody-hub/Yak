@@ -16,7 +16,7 @@ create a key with the scopes you need.
 | `reports:write` | Create reports, append reporter messages |
 | `reports:read` | Read report status and conversation |
 | `events:write` | Send analytics events |
-| `users:write` | Create and update app users |
+| `users:write` | Create, update, and delete app users |
 
 The key is shown **once**. It looks like `yak_live_xxxxxxxx…`.
 
@@ -66,12 +66,21 @@ curl -X POST https://your-api.up.railway.app/api/v1/reports \
 | `subject` | yes | Up to 200 characters |
 | `body` | yes | Up to 10,000 characters |
 | `priority` | no | `urgent`, `high`, `medium`, `low`. Defaults to `medium` |
-| `reporter.name` | yes | |
-| `reporter.email` | yes | Links the report to the user's support history |
-| `reporter.externalUserId` | no | Your own user id, if you have one |
-| `platform` | no | `ios`, `android`, `web`. Defaults to `web` |
-| `appVersion` | no | |
+| `reporter.name` | yes | Up to 120 characters |
+| `reporter.email` | one of these two | A valid address. Leave it out for users who have none |
+| `reporter.externalUserId` | one of these two | Your own user id. Links the report to the user's support history |
+| `platform` | no | `ios`, `android`, or `web`. Left blank when omitted |
+| `appVersion` | no | Up to 40 characters |
 | `metadata` | no | Arbitrary JSON kept alongside the report |
+
+Send at least one of `reporter.email` and `reporter.externalUserId`. Send both
+when you have both.
+
+**Retrying safely.** Add an `Idempotency-Key` header (any string up to 200
+characters, unique per submission, such as your own feedback id). If the same
+key arrives again, the first report is returned with `200` instead of `201`
+and no second ticket or notification is created. Without the header, every
+call creates a new report.
 
 The response includes a `token`:
 
@@ -138,23 +147,40 @@ Batch, up to 200 per request:
 { "events": [ { "name": "screen_viewed", "userId": "u_1842" }, … ] }
 ```
 
+| Field | Required | Notes |
+| --- | --- | --- |
+| `name` | yes | Up to 120 characters. Letters, numbers, and `_ . : -` only |
+| `userId` | no | Your own user id, the same value as `externalId` in user sync |
+| `userName` | no | Shown in the live event stream |
+| `anonymousId` | no | For events before sign-in |
+| `sessionId` | no | |
+| `platform` | no | `ios`, `android`, or `web` |
+| `appVersion` | no | Up to 40 characters |
+| `properties` | no | Flat object. Values must be strings (up to 500 characters), numbers, or booleans |
+| `timestamp` | no | ISO 8601. When the event happened on the device. Defaults to the receipt time |
+
 Rules worth knowing:
 
-- `name` may contain letters, numbers, and `_ . : -` only.
-- `properties` values must be strings, numbers, or booleans. Nested objects are
-  rejected so the data stays queryable.
+- Nested objects in `properties` are rejected so the data stays queryable.
 - `timestamp` is your client's clock. If it is more than a day in the future or
   more than 30 days old it is replaced with the receipt time, so one device
-  with a bad clock cannot distort the charts.
-- Success returns `202 Accepted` with `{ "data": { "accepted": n } }`.
+  with a bad clock cannot distort the charts. The event is still accepted, and
+  the response counts how many were adjusted.
+- Success returns `202 Accepted` with
+  `{ "data": { "accepted": n, "clamped": n } }`. `clamped` is the number of
+  events whose timestamp was replaced. If it is not zero, check the clocks or
+  the age of what you are sending.
 - Validation is all-or-nothing per request: one bad event rejects the batch so
   you can fix and retry rather than silently lose data.
+- Events older than 30 days cannot be backfilled onto their original day.
 
 ## 8. Sync your users
 
 `PUT /api/v1/users` — scope `users:write`
 
-Idempotent on `externalId`, so it is safe to call on every sign-in.
+Idempotent on `externalId`, so it is safe to call on every sign-in. Call it
+when a user signs in and when their subscription changes. You do not need to
+load your whole user base first: the panel fills in as people use your app.
 
 ```json
 {
@@ -169,9 +195,65 @@ Idempotent on `externalId`, so it is safe to call on every sign-in.
 }
 ```
 
+| Field | Required | Notes |
+| --- | --- | --- |
+| `externalId` | yes | Your own user id. Up to 120 characters |
+| `name` | yes | Up to 120 characters |
+| `email` | no | A valid address. Leave it out, or send `null`, for users who have none |
+| `avatarUrl` | no | An image URL |
+| `plan` | no | Your own plan name, up to 60 characters. Defaults to `free` |
+| `billingPeriod` | no | `none`, `monthly`, or `annual`. Defaults to `none` |
+| `platform` | no | `ios`, `android`, or `web`. Left blank when omitted |
+| `status` | no | `active`, `trialing`, or `churned`. Defaults to `active` |
+| `renewsAt` | no | ISO 8601. Next renewal, or the end of the trial |
+| `createdAt` | no | ISO 8601. When the account was created in your app. Defaults to the first sync |
+| `notify` | no | `false` skips the Discord alerts for this call. Defaults to `true` |
+| `metadata` | no | Arbitrary JSON kept alongside the user |
+
+Unknown fields are rejected with `422`, and so is a missing `name` or a
+malformed `email`.
+
+The body replaces the stored record. A field you leave out goes back to its
+default, so send everything you know on every call.
+
+**Plans.** Use your own plan names (`premium`, `team`, anything). They are
+stored in lowercase, so `Premium` and `premium` are one plan. `free` is the
+one reserved name: it means the user is not paying, and every other plan
+counts as paid in the panel's totals.
+
+**Status.**
+
+| Status | Meaning |
+| --- | --- |
+| `active` | Has access now: a paying subscriber, or a user on the `free` plan |
+| `trialing` | In a free trial of a paid plan |
+| `churned` | Had a paid subscription or a trial that ended, and has not come back |
+
+A user who never paid is `active` on the `free` plan, not `churned`.
+
+**Existing accounts.** The first sync of a user creates the record and would
+fire the `new_user` Discord alert. For an account that existed before you
+integrated, send its real `createdAt` and `notify: false`, so it is neither
+announced nor counted as new.
+
 This powers the panel's user search and the subscription details in the user
 side panel. It also drives two Discord triggers: `new_user` on first insert,
 and `new_subscription` when a user moves off the `free` plan.
+
+### Delete a user
+
+`DELETE /api/v1/users/{externalId}` — scope `users:write`
+
+Call this when someone deletes their account in your app. It permanently
+removes the user record, their analytics events, and their support reports
+with the whole conversation. It cannot be undone.
+
+```json
+{ "data": { "deleted": { "user": true, "events": 412, "reports": 2 } } }
+```
+
+It returns `200` even when there was nothing to delete, so it is safe to
+retry.
 
 ## 9. Receive webhooks
 
@@ -243,11 +325,25 @@ Every error uses the same envelope:
 
 ## Rate limits
 
-Keyed per API key, not per IP, so one integration cannot starve another.
+Keyed per API key, not per IP, so one integration cannot starve another. The
+limits count requests, not events.
 
-| Endpoint group | Limit |
+| Endpoint group | Default limit |
 | --- | --- |
 | Reports and users | 600 requests/minute |
-| Events | 300 requests/minute (batch to raise effective throughput) |
+| Events | 300 requests/minute |
+
+An events request can carry 200 events, so the default allows 60,000 events a
+minute from a backend that batches. Forwarding one event per request is what
+runs out.
+
+Both limits are settings on the deployment (`INGEST_RATE_LIMIT_PER_MINUTE` and
+`EVENT_INGEST_RATE_LIMIT_PER_MINUTE`) and can be raised for a busier app.
 
 Responses carry standard `RateLimit-*` headers.
+
+## Troubleshooting a key
+
+**Settings → Integrations** shows, for each key, when it was last used and the
+last request that was rejected with the reason: a missing scope, a validation
+error with the field name, or a rate limit.
