@@ -165,7 +165,8 @@ Requires the `users` permission.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/?q=` | Search by name, email, or external id. Empty query returns nothing. |
+| GET | `/?q=` | Search by name, email, or external id. An empty query returns the most recently added users. `meta.total` is the size of the whole roster. |
+| GET | `/stats?days=` | Totals by status and by plan. `plans` is keyed by the app's own plan names; `paid` is everyone not on `free`. |
 | GET | `/:externalId` | Profile plus full support history. |
 
 ## Settings (`/api/settings`)
@@ -201,7 +202,7 @@ Requires the `owner` or `admin` role.
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/scopes` | Available scopes with descriptions. |
-| GET | `/` | All keys. Never includes the secret. |
+| GET | `/` | All keys. Never includes the secret. Each carries `lastUsedAt`, plus `lastErrorAt` and `lastError` for the most recent rejected request. |
 | POST | `/` | `{ name, scopes, expiresAt? }`. `meta.key` holds the plaintext, shown once. |
 | POST | `/:id/revoke` | Revoke but keep the audit record. |
 | DELETE | `/:id` | Delete entirely. |

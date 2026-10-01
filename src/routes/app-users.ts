@@ -1,4 +1,4 @@
-import { asc, count, desc, eq, gte, ilike, or } from "drizzle-orm"
+import { and, asc, count, desc, eq, gte, ilike, isNull, or } from "drizzle-orm"
 import { Router } from "express"
 import { z } from "zod"
 
@@ -13,8 +13,9 @@ export const appUsersRouter: Router = Router()
 /**
  * Search over the integrating application's end users.
  *
- * An empty query returns nothing on purpose: the panel's Users page is a
- * lookup tool, not a full directory dump.
+ * An empty query returns the most recently added users, so the page shows
+ * that the sync is working before anyone types. `meta.total` is the size of
+ * the whole roster; the list itself is never more than `limit` rows.
  */
 appUsersRouter.get(
   "/",
@@ -27,8 +28,17 @@ appUsersRouter.get(
   async (req, res) => {
     const { q, limit } = validatedQuery<{ q: string; limit: number }>(req)
 
+    const [roster] = await db.select({ total: count() }).from(appUsers)
+    const meta = { total: Number(roster?.total ?? 0) }
+
     if (!q) {
-      res.json({ data: [] })
+      const recent = await db
+        .select()
+        .from(appUsers)
+        .orderBy(desc(appUsers.createdAt))
+        .limit(limit)
+
+      res.json({ data: recent.map(serializeAppUser), meta })
       return
     }
 
@@ -47,7 +57,7 @@ appUsersRouter.get(
       .orderBy(asc(appUsers.name))
       .limit(limit)
 
-    res.json({ data: rows.map(serializeAppUser) })
+    res.json({ data: rows.map(serializeAppUser), meta })
   }
 )
 
@@ -91,7 +101,9 @@ appUsersRouter.get(
       total += Number(row.total)
     }
 
-    const planTotals = { free: 0, plus: 0, pro: 0 }
+    // Plan names are the integrating app's own, so the keys are whatever it
+    // has sent. `free` is always present because "paid" is defined against it.
+    const planTotals: Record<string, number> = { free: 0 }
 
     for (const row of byPlan) {
       planTotals[row.plan] = Number(row.total)
@@ -102,7 +114,7 @@ appUsersRouter.get(
         windowDays: days,
         total,
         ...statusTotals,
-        paid: planTotals.plus + planTotals.pro,
+        paid: total - (planTotals.free ?? 0),
         plans: planTotals,
         newInWindow: Number(recent?.total ?? 0),
       },
@@ -127,10 +139,22 @@ appUsersRouter.get(
       throw new NotFoundError("User")
     }
 
+    // Reports carrying the user's id are theirs. Ones filed without an id
+    // are matched on the address, when the user has one.
     const history = await db
       .select()
       .from(reports)
-      .where(eq(reports.reporterEmail, row.email))
+      .where(
+        or(
+          eq(reports.externalUserId, row.externalId),
+          row.email
+            ? and(
+                isNull(reports.externalUserId),
+                eq(reports.reporterEmail, row.email)
+              )
+            : undefined
+        )
+      )
       .orderBy(desc(reports.updatedAt))
       .limit(50)
 

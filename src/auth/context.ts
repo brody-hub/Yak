@@ -40,7 +40,7 @@ export const API_KEY_SCOPE_LABELS: Record<ApiKeyScope, string> = {
   "reports:write": "Create reports and post reporter messages",
   "reports:read": "Read report status and conversation",
   "events:write": "Send analytics events",
-  "users:write": "Create and update app users",
+  "users:write": "Create, update, and delete app users",
 }
 
 export function isValidScope(value: string): value is ApiKeyScope {

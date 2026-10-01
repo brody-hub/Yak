@@ -7,6 +7,7 @@ import { apiKeys } from "../db/schema.js"
 import { sha256 } from "../lib/crypto.js"
 import { ForbiddenError, UnauthorizedError } from "../lib/errors.js"
 import { logger } from "../logger.js"
+import { recordApiKeyFailure } from "../services/api-key-usage.js"
 
 /**
  * Reads the API key from either `Authorization: Bearer <key>` or the
@@ -57,6 +58,11 @@ export function requireApiKey(...requiredScopes: ApiKeyScope[]): RequestHandler 
       }
 
       if (record.expiresAt && record.expiresAt.getTime() < Date.now()) {
+        recordApiKeyFailure(record.id, req, {
+          status: 401,
+          code: "unauthorized",
+          detail: "This API key has expired",
+        })
         throw new UnauthorizedError("This API key has expired")
       }
 
@@ -65,9 +71,14 @@ export function requireApiKey(...requiredScopes: ApiKeyScope[]): RequestHandler 
       )
 
       if (missing.length > 0) {
-        throw new ForbiddenError(
-          `This API key is missing the ${missing.join(", ")} scope`
-        )
+        const detail = `This API key is missing the ${missing.join(", ")} scope`
+
+        recordApiKeyFailure(record.id, req, {
+          status: 403,
+          code: "forbidden",
+          detail,
+        })
+        throw new ForbiddenError(detail)
       }
 
       req.apiKey = {

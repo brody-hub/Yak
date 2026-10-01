@@ -1,5 +1,5 @@
 import { and, asc, desc, eq } from "drizzle-orm"
-import { Router } from "express"
+import { Router, type Request } from "express"
 import { z } from "zod"
 
 import { db } from "../../db/index.js"
@@ -17,6 +17,60 @@ export const publicReportsRouter: Router = Router()
 
 const tokenParamSchema = z.object({ token: z.string().min(1).max(64) })
 
+/** An empty string means "no value", which apps often send for a blank field. */
+const blankToNull = (value: unknown) =>
+  typeof value === "string" && value.trim() === "" ? null : value
+
+const IDEMPOTENCY_KEY_MAX = 200
+/** Postgres unique violation. */
+const UNIQUE_VIOLATION = "23505"
+
+function readIdempotencyKey(req: Request): string | null {
+  const key = req.get("idempotency-key")?.trim()
+
+  if (!key) {
+    return null
+  }
+
+  if (key.length > IDEMPOTENCY_KEY_MAX) {
+    throw new BadRequestError(
+      `Idempotency-Key must be at most ${IDEMPOTENCY_KEY_MAX} characters`
+    )
+  }
+
+  return key
+}
+
+/** The driver error sits on `cause` when the query builder wraps it. */
+function isUniqueViolation(error: unknown): boolean {
+  const candidate = error as { code?: string; cause?: { code?: string } } | null
+
+  return (
+    candidate?.code === UNIQUE_VIOLATION ||
+    candidate?.cause?.code === UNIQUE_VIOLATION
+  )
+}
+
+async function findByIdempotencyKey(key: string) {
+  const [row] = await db
+    .select()
+    .from(reports)
+    .where(eq(reports.idempotencyKey, key))
+    .limit(1)
+
+  if (!row) {
+    return null
+  }
+
+  const messages = await db
+    .select()
+    .from(reportMessages)
+    .where(eq(reportMessages.reportId, row.id))
+    .orderBy(asc(reportMessages.createdAt))
+
+  return serializeReportForApi(row, messages)
+}
+
 const REPORT_TYPE_LABELS = {
   bug: "Bug",
   suggestion: "Suggestion",
@@ -29,6 +83,10 @@ const REPORT_TYPE_LABELS = {
  *
  * Returns a `token` the app can store against the submission to poll status or
  * append messages later without needing a read-scoped key.
+ *
+ * An `Idempotency-Key` header makes the call safe to retry: a repeat with the
+ * same key returns the report the first call created, with `200` instead of
+ * `201`, and does not notify anyone a second time.
  */
 publicReportsRouter.post(
   "/",
@@ -41,12 +99,21 @@ publicReportsRouter.post(
         subject: z.string().trim().min(1).max(200),
         body: z.string().trim().min(1).max(10_000),
         priority: z.enum(["urgent", "high", "medium", "low"]).default("medium"),
-        reporter: z.object({
-          name: z.string().trim().min(1).max(120),
-          email: z.string().trim().toLowerCase().email(),
-          externalUserId: z.string().trim().max(120).optional(),
-        }),
-        platform: z.enum(["ios", "android", "web"]).default("web"),
+        reporter: z
+          .object({
+            name: z.string().trim().min(1).max(120),
+            email: z.preprocess(
+              blankToNull,
+              z.string().trim().toLowerCase().email().nullable().optional()
+            ),
+            externalUserId: z.string().trim().max(120).optional(),
+          })
+          // Something has to tie the report back to a person.
+          .refine((value) => value.email || value.externalUserId, {
+            message: "Provide reporter.email or reporter.externalUserId",
+            path: ["email"],
+          }),
+        platform: z.enum(["ios", "android", "web"]).nullable().optional(),
         appVersion: z.string().trim().max(40).optional(),
         metadata: z.record(z.string(), z.unknown()).optional(),
       })
@@ -59,50 +126,82 @@ publicReportsRouter.post(
       subject: string
       body: string
       priority: "urgent" | "high" | "medium" | "low"
-      reporter: { name: string; email: string; externalUserId?: string }
-      platform: "ios" | "android" | "web"
+      reporter: { name: string; email?: string | null; externalUserId?: string }
+      platform?: "ios" | "android" | "web" | null
       appVersion?: string
       metadata?: Record<string, unknown>
     }
 
-    const row = await db.transaction(async (tx) => {
-      const [created] = await tx
-        .insert(reports)
-        .values({
-          id: newId(),
-          type: body.type,
-          status: "open",
-          priority: body.priority,
-          subject: body.subject,
-          body: body.body,
-          reporterName: body.reporter.name,
-          reporterEmail: body.reporter.email,
-          externalUserId: body.reporter.externalUserId ?? null,
-          platform: body.platform,
-          appVersion: body.appVersion ?? null,
-          metadata: body.metadata ?? null,
-          source: "api",
-          apiKeyId: apiKey.id,
-          publicToken: generatePublicToken(),
-        })
-        .returning()
+    const idempotencyKey = readIdempotencyKey(req)
 
-      if (!created) {
-        throw new BadRequestError("Could not create report")
+    if (idempotencyKey) {
+      const replay = await findByIdempotencyKey(idempotencyKey)
+
+      if (replay) {
+        res.status(200).json({ data: replay })
+        return
       }
+    }
 
-      // The opening message mirrors the body so the inbox renders a single
-      // continuous conversation.
-      await tx.insert(reportMessages).values({
-        id: newId(),
-        reportId: created.id,
-        authorType: "user",
-        authorName: body.reporter.name,
-        body: body.body,
+    const createReport = () =>
+      db.transaction(async (tx) => {
+        const [created] = await tx
+          .insert(reports)
+          .values({
+            id: newId(),
+            type: body.type,
+            status: "open",
+            priority: body.priority,
+            subject: body.subject,
+            body: body.body,
+            reporterName: body.reporter.name,
+            reporterEmail: body.reporter.email ?? null,
+            externalUserId: body.reporter.externalUserId || null,
+            platform: body.platform ?? null,
+            appVersion: body.appVersion ?? null,
+            metadata: body.metadata ?? null,
+            source: "api",
+            apiKeyId: apiKey.id,
+            idempotencyKey,
+            publicToken: generatePublicToken(),
+          })
+          .returning()
+
+        if (!created) {
+          throw new BadRequestError("Could not create report")
+        }
+
+        // The opening message mirrors the body so the inbox renders a single
+        // continuous conversation.
+        await tx.insert(reportMessages).values({
+          id: newId(),
+          reportId: created.id,
+          authorType: "user",
+          authorName: body.reporter.name,
+          body: body.body,
+        })
+
+        return created
       })
 
-      return created
-    })
+    let row: Awaited<ReturnType<typeof createReport>>
+
+    try {
+      row = await createReport()
+    } catch (error) {
+      // Two copies of the same request raced; the other one won the insert.
+      const replay =
+        idempotencyKey && isUniqueViolation(error)
+          ? await findByIdempotencyKey(idempotencyKey)
+          : null
+
+      if (!replay) {
+        throw error
+      }
+
+      res.status(200).json({ data: replay })
+      return
+    }
 
     const messages = await db
       .select()
@@ -113,9 +212,14 @@ publicReportsRouter.post(
       title: `${REPORT_TYPE_LABELS[row.type]} #${row.number}`,
       description: row.subject,
       fields: [
-        { name: "From", value: `${row.reporterName} (${row.reporterEmail})` },
+        {
+          name: "From",
+          value: row.reporterEmail
+            ? `${row.reporterName} (${row.reporterEmail})`
+            : row.reporterName,
+        },
         { name: "Priority", value: row.priority, inline: true },
-        { name: "Platform", value: row.platform, inline: true },
+        { name: "Platform", value: row.platform ?? "Unknown", inline: true },
       ],
     })
 

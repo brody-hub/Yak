@@ -288,6 +288,8 @@ export function serializeApiKey(row: ApiKey) {
     prefix: row.prefix,
     scopes: row.scopes,
     lastUsedAt: row.lastUsedAt?.toISOString() ?? null,
+    lastErrorAt: row.lastErrorAt?.toISOString() ?? null,
+    lastError: row.lastError,
     expiresAt: row.expiresAt?.toISOString() ?? null,
     revokedAt: row.revokedAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),

@@ -71,6 +71,7 @@ export function createApp(): Express {
         "Authorization",
         "X-API-Key",
         "X-Request-Id",
+        "Idempotency-Key",
       ],
       exposedHeaders: ["X-Request-Id"],
       maxAge: 86_400,

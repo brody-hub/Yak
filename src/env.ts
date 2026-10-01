@@ -55,6 +55,16 @@ const schema = z.object({
   R2_JURISDICTION: z.preprocess(emptyToUndefined, z.string().optional()),
   R2_URL_TTL: z.coerce.number().int().positive().default(3600),
 
+  // Ingest API ceilings, in requests per minute per API key.
+  INGEST_RATE_LIMIT_PER_MINUTE: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().int().positive().default(600)
+  ),
+  EVENT_INGEST_RATE_LIMIT_PER_MINUTE: z.preprocess(
+    emptyToUndefined,
+    z.coerce.number().int().positive().default(300)
+  ),
+
   OWNER_EMAIL: z.preprocess(emptyToUndefined, z.string().email().optional()),
   OWNER_NAME: z.preprocess(emptyToUndefined, z.string().optional()),
 })
