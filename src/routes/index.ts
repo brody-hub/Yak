@@ -6,7 +6,7 @@ import {
   requireApiKeyManagement,
   requirePermission,
 } from "../middleware/permissions.js"
-import { panelLimiter, uploadLimiter } from "../middleware/rate-limit.js"
+import { authLimiter, panelLimiter, uploadLimiter } from "../middleware/rate-limit.js"
 import { signedImageUrl } from "../services/r2.js"
 import { activityRouter } from "./activity.js"
 import { analyticsRouter } from "./analytics.js"
@@ -96,8 +96,9 @@ export const publicMetaRouter: Router = Router()
 publicMetaRouter.use("/media", mediaRouter)
 
 // Sideshift's OAuth redirect. Authenticated by its one-time `state`, not the
-// session cookie, which lives on the panel's host rather than this one.
-publicMetaRouter.use(sideshiftCallbackRouter)
+// session cookie, which lives on the panel's host rather than this one. The
+// auth limiter fits: it is hit once per connect, like a sign-in.
+publicMetaRouter.use(authLimiter, sideshiftCallbackRouter)
 
 /**
  * Lets the login screen render tenant branding before anyone signs in.
