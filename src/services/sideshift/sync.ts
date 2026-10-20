@@ -307,7 +307,7 @@ async function syncCreators(session: Session) {
         creators.slice(index, index + WRITE_CHUNK).map((creator) => ({
           id: creator.id,
           name: creator.name || "Unknown creator",
-          avatarUrl: creator.avatarUrl ?? null,
+          avatarUrl: safeUrl(creator.avatarUrl),
           updatedAt: now,
         }))
       )
@@ -365,6 +365,24 @@ function toDate(epoch: number | null | undefined, fallback?: string | null) {
   return null
 }
 
+/**
+ * Only http(s) links from Sideshift are kept. Post links become `<a href>` in
+ * the panel, and a `javascript:` URL there would run as the viewer. Sideshift
+ * is a trusted partner, but the links originate from scraped social posts.
+ */
+function safeUrl(value: string | null | undefined) {
+  if (typeof value !== "string" || value.length > 2048) {
+    return null
+  }
+
+  try {
+    const url = new URL(value)
+    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : null
+  } catch {
+    return null
+  }
+}
+
 function count(value: number | null | undefined) {
   return typeof value === "number" && Number.isFinite(value)
     ? Math.max(0, Math.round(value))
@@ -419,8 +437,8 @@ async function syncPosts(
           creatorHandle: row.creator ?? null,
           creatorName: row.contractorName ?? null,
           title: row.title ?? null,
-          thumbnailUrl: row.thumbnail ?? null,
-          postUrl: row.postPage ?? null,
+          thumbnailUrl: safeUrl(row.thumbnail),
+          postUrl: safeUrl(row.postPage),
           uploadedAt: toDate(row.uploadedAt, row.uploadDate),
           views: count(row.views),
           likes: count(row.likes),
