@@ -63,7 +63,15 @@ domains to `CORS_ORIGINS` as a comma-separated list.
 
 **Do not rotate `ENCRYPTION_KEY` casually.** Stored Discord webhook URLs and
 webhook signing secrets are encrypted with it and become unreadable if it
-changes. Re-enter them in the panel after a rotation.
+changes. Re-enter them in the panel after a rotation. The same goes for the
+Sideshift connection: after a rotation, reconnect Sideshift from Settings →
+Integrations.
+
+**Sideshift** needs no variables. The first Connect click registers this
+deployment with Sideshift as an OAuth client whose callback is
+`API_URL/api/sideshift/callback`, so `API_URL` must be the public HTTPS
+address. If `API_URL` changes later, the next Connect registers again.
+`SIDESHIFT_URL` exists only to point at a mock in tests; leave it unset.
 
 ## 4. Frontend service
 

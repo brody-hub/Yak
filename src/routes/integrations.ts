@@ -11,6 +11,7 @@ import { getAuth } from "../middleware/auth.js"
 import { requireApiKeyManagement } from "../middleware/permissions.js"
 import { validate } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
+import { loadConnection as loadSideshiftConnection } from "../services/sideshift/connection.js"
 import {
   apiKeyHint,
   clearRevenueCatCache,
@@ -34,7 +35,7 @@ const PROVIDERS = [
 ]
 
 type IntegrationStatus = {
-  provider: "revenuecat"
+  provider: "revenuecat" | "sideshift"
   label: string
   capabilities: string[]
   connected: boolean
@@ -82,11 +83,40 @@ integrationsRouter.get("/", async (req, res) => {
   const byProvider = new Map(rows.map((row) => [row.provider, row]))
 
   res.json({
-    data: PROVIDERS.map((provider) =>
-      buildStatus(provider, byProvider.get(provider.id), privileged)
-    ),
+    data: [
+      ...PROVIDERS.map((provider) =>
+        buildStatus(provider, byProvider.get(provider.id), privileged)
+      ),
+      await sideshiftIntegrationStatus(privileged),
+    ],
   })
 })
+
+/**
+ * Sideshift connects over OAuth (see routes/sideshift.ts), so it has no key or
+ * hint. It is listed here so dashboard widgets can tell whether campaign data
+ * exists. A connection that needs reconnecting still counts as connected:
+ * its cached data is still there to show.
+ */
+async function sideshiftIntegrationStatus(
+  privileged: boolean
+): Promise<IntegrationStatus> {
+  const row = await loadSideshiftConnection()
+  const connected = Boolean(row && row.status !== "disconnected")
+
+  return {
+    provider: "sideshift",
+    label: "Sideshift",
+    capabilities: ["campaign-analytics"],
+    connected,
+    apiKeyHint: null,
+    projectId: privileged && connected ? (row?.companyId ?? null) : null,
+    projectName: privileged && connected ? (row?.companyName ?? null) : null,
+    connectedAt: row?.connectedAt?.toISOString() ?? null,
+    lastCheckedAt: row?.lastSyncedAt?.toISOString() ?? null,
+    lastError: privileged ? (row?.lastError ?? null) : null,
+  }
+}
 
 /* -------------------------------------------------------------------------- */
 /* RevenueCat                                                                  */

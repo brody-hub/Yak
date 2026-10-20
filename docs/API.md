@@ -24,6 +24,7 @@ Paginated endpoints return:
 | --- | --- | --- |
 | GET | `/health` | Liveness plus a database check. `503` if the database is unreachable. |
 | GET | `/api/config` | Tenant name and password policy, for the login screen. |
+| GET | `/api/sideshift/callback` | Sideshift's OAuth redirect. Authenticated by the one-time `state` from `POST /api/sideshift/connect`, not the session. Always redirects to `APP_URL/marketing?sideshift=<outcome>`. |
 
 ## Auth (`/api/auth/*`, handled by Better Auth)
 
@@ -132,6 +133,32 @@ Trend responses carry `available`. When it is false, `reason` is one of
 Chart ids are the panel's own (`active_subscriptions`, `new_customers`, …) and
 are mapped to RevenueCat's chart names (`actives`, `customers_new`, …) on the
 server so saved dashboard layouts stay stable.
+
+## Sideshift (`/api/sideshift`)
+
+Requires the `marketing` permission. Connecting, disconnecting and choosing
+campaigns are owner/admin only. Campaign analytics are read from Sideshift's
+Platform API over OAuth with the read-only `analytics:read` scope and kept in
+local tables, so reads never wait on Sideshift.
+
+There is no scheduler. Reading `status` or `analytics` starts a background sync
+when the last one began over an hour ago. Every sync holds a Postgres advisory
+lock, so concurrent viewers start at most one. A new campaign backfills 365
+days of daily history; afterwards each sync re-reads the last 3 days.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/status` | Connection state (`disconnected`, `connected`, `needs_reconnect`, `subscription_inactive`), last sync, whether one is running, last error, and every campaign with its `tracked` flag. |
+| GET | `/analytics?campaign=&range=&sort=` | `campaign` is a tracked id or `all`; `range` is `7d`, `30d` or `all`; `sort` is `views` or `newest`. Returns summary cards, a daily series, creator rows and up to 60 posts. |
+| POST | `/refresh` | Starts a sync now. `202`; `429` within a minute of the last one; `409` while the connection needs reconnecting. |
+| PUT | `/campaigns` | `{ tracked: string[] }`. Owner/admin. Newly tracked campaigns sync immediately. |
+| POST | `/connect` | Owner/admin. Registers this deployment with Sideshift on first use, then returns `{ authorizeUrl }` for the browser to open. |
+| DELETE | `/connection` | Owner/admin. Revokes the token at Sideshift and deletes all cached campaign data. |
+
+With a `7d` or `30d` range, views and engagement are what was gained inside the
+window, while posts and creators count what was posted inside it. With `all`,
+every number is lifetime. Engagement is likes + comments + shares; engagement
+rate is engagement ÷ views.
 
 ## Dashboard (`/api/dashboard`)
 

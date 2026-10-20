@@ -65,6 +65,12 @@ const schema = z.object({
     z.coerce.number().int().positive().default(300)
   ),
 
+  // Sideshift's origin. Only overridden to point at a local mock in testing.
+  SIDESHIFT_URL: z.preprocess(
+    emptyToUndefined,
+    urlNoTrailingSlash.default("https://app.sideshift.app")
+  ),
+
   OWNER_EMAIL: z.preprocess(emptyToUndefined, z.string().email().optional()),
   OWNER_NAME: z.preprocess(emptyToUndefined, z.string().optional()),
 })

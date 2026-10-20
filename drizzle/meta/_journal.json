@@ -22,6 +22,13 @@
       "when": 1790851417005,
       "tag": "0002_shredder_integration_feedback",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1792508019631,
+      "tag": "0003_sideshift_campaign_analytics",
+      "breakpoints": true
     }
   ]
 }

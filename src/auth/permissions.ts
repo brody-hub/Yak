@@ -12,6 +12,7 @@
 export const PANEL_PERMISSIONS = [
   "dashboard",
   "kpis",
+  "marketing",
   "tasks",
   "users",
   "reports",
@@ -29,6 +30,7 @@ export const PANEL_PERMISSION_GROUPS: Record<
 > = {
   dashboard: { label: "Dashboard", group: "Main" },
   kpis: { label: "KPIs", group: "Main" },
+  marketing: { label: "Marketing", group: "Main" },
   tasks: { label: "Tasks", group: "Main" },
   users: { label: "Users", group: "Support" },
   reports: { label: "Reports", group: "Support" },
