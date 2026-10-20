@@ -6,7 +6,7 @@ import {
   requireApiKeyManagement,
   requirePermission,
 } from "../middleware/permissions.js"
-import { panelLimiter, uploadLimiter } from "../middleware/rate-limit.js"
+import { authLimiter, panelLimiter, uploadLimiter } from "../middleware/rate-limit.js"
 import { signedImageUrl } from "../services/r2.js"
 import { activityRouter } from "./activity.js"
 import { analyticsRouter } from "./analytics.js"
@@ -23,6 +23,7 @@ import { publicReportsRouter } from "./public/reports.js"
 import { publicUsersRouter } from "./public/users.js"
 import { reportsRouter } from "./reports.js"
 import { loadSettings, settingsRouter } from "./settings.js"
+import { sideshiftCallbackRouter, sideshiftRouter } from "./sideshift.js"
 import { systemUsersRouter } from "./system-users.js"
 import { tasksRouter } from "./tasks.js"
 import { uploadsRouter } from "./uploads.js"
@@ -67,6 +68,7 @@ panel.use("/kpis", requirePermission("kpis"), kpisRouter)
 panel.use("/app-users", requirePermission("users"), appUsersRouter)
 panel.use("/settings", requirePermission("theme"), settingsRouter)
 panel.use("/discord", requirePermission("discord"), discordRouter)
+panel.use("/sideshift", requirePermission("marketing"), sideshiftRouter)
 
 // A user only ever reads and writes their own layout, so no section gate: the
 // widgets themselves read from endpoints that are already permission checked.
@@ -92,6 +94,11 @@ export const publicMetaRouter: Router = Router()
 
 // Stable avatar/logo URLs redirect here to short-lived R2 signed GETs.
 publicMetaRouter.use("/media", mediaRouter)
+
+// Sideshift's OAuth redirect. Authenticated by its one-time `state`, not the
+// session cookie, which lives on the panel's host rather than this one. The
+// auth limiter fits: it is hit once per connect, like a sign-in.
+publicMetaRouter.use(authLimiter, sideshiftCallbackRouter)
 
 /**
  * Lets the login screen render tenant branding before anyone signs in.

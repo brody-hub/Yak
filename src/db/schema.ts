@@ -1,10 +1,13 @@
 import {
+  bigint,
   boolean,
+  date,
   index,
   integer,
   jsonb,
   pgEnum,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -114,6 +117,11 @@ export const webhookDeliveryStatusEnum = pgEnum("webhook_delivery_status", [
 export const integrationProviderEnum = pgEnum("integration_provider", [
   "revenuecat",
 ])
+
+export const sideshiftConnectionStatusEnum = pgEnum(
+  "sideshift_connection_status",
+  ["disconnected", "connected", "needs_reconnect", "subscription_inactive"]
+)
 
 /* -------------------------------------------------------------------------- */
 /* Better Auth core tables                                                     */
@@ -681,6 +689,139 @@ export const dashboardLayouts = pgTable("dashboard_layouts", {
 })
 
 /* -------------------------------------------------------------------------- */
+/* Sideshift: campaign analytics read over OAuth                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The single Sideshift connection for this deployment. Sideshift is reached
+ * over OAuth rather than a pasted key, so this holds the OAuth client Yak
+ * registered for itself, the founder's tokens, and the in-flight authorization
+ * request. Every secret is AES-256-GCM ciphertext and never leaves the server.
+ *
+ * The client registration survives a disconnect so reconnecting does not
+ * register a second client with Sideshift.
+ */
+export const sideshiftConnection = pgTable("sideshift_connection", {
+  id: text("id").primaryKey().default("default"),
+  status: sideshiftConnectionStatusEnum("status")
+    .notNull()
+    .default("disconnected"),
+
+  clientId: text("client_id"),
+  clientSecretEncrypted: text("client_secret_encrypted"),
+  registrationAccessTokenEncrypted: text("registration_access_token_encrypted"),
+  /** The callback the client was registered with; a new API_URL re-registers. */
+  redirectUri: text("redirect_uri"),
+
+  accessTokenEncrypted: text("access_token_encrypted"),
+  accessTokenExpiresAt: timestamp("access_token_expires_at", {
+    withTimezone: true,
+  }),
+  refreshTokenEncrypted: text("refresh_token_encrypted"),
+  scope: text("scope"),
+  companyId: text("company_id"),
+  companyName: text("company_name"),
+  connectedByUserId: text("connected_by_user_id").references(() => user.id, {
+    onDelete: "set null",
+  }),
+  connectedAt: timestamp("connected_at", { withTimezone: true }),
+
+  /** SHA-256 of the pending `state`; the raw value only exists in the URL. */
+  oauthStateHash: text("oauth_state_hash"),
+  oauthVerifierEncrypted: text("oauth_verifier_encrypted"),
+  oauthStartedAt: timestamp("oauth_started_at", { withTimezone: true }),
+  oauthStartedByUserId: text("oauth_started_by_user_id"),
+
+  syncStartedAt: timestamp("sync_started_at", { withTimezone: true }),
+  lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
+  lastError: text("last_error"),
+  lastErrorAt: timestamp("last_error_at", { withTimezone: true }),
+  /** Sideshift's `requestId` for the last failure, for their support. */
+  lastErrorRequestId: text("last_error_request_id"),
+
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+})
+
+/** Every campaign Sideshift reports, and whether the founder tracks it. */
+export const sideshiftCampaigns = pgTable("sideshift_campaigns", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  status: text("status").notNull(),
+  tracked: boolean("tracked").notNull().default(false),
+  /** Set when the campaign stops appearing in Sideshift's list. */
+  removedAt: timestamp("removed_at", { withTimezone: true }),
+  /** Set once the daily history for this campaign has been backfilled. */
+  historyBackfilledAt: timestamp("history_backfilled_at", {
+    withTimezone: true,
+  }),
+  firstSeenAt: timestamp("first_seen_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+})
+
+/**
+ * Posts in tracked campaigns with their latest cumulative stats. A post can
+ * belong to several campaigns, so membership is an array rather than a key.
+ */
+export const sideshiftPosts = pgTable(
+  "sideshift_posts",
+  {
+    id: text("id").primaryKey(),
+    platform: text("platform").notNull(),
+    creatorId: text("creator_id"),
+    creatorHandle: text("creator_handle"),
+    creatorName: text("creator_name"),
+    title: text("title"),
+    thumbnailUrl: text("thumbnail_url"),
+    postUrl: text("post_url"),
+    uploadedAt: timestamp("uploaded_at", { withTimezone: true }),
+    views: bigint("views", { mode: "number" }).notNull().default(0),
+    likes: bigint("likes", { mode: "number" }).notNull().default(0),
+    comments: bigint("comments", { mode: "number" }).notNull().default(0),
+    shares: bigint("shares", { mode: "number" }).notNull().default(0),
+    campaignIds: text("campaign_ids").array().notNull().default([]),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("sideshift_posts_campaign_ids_idx").using("gin", table.campaignIds),
+    index("sideshift_posts_uploaded_at_idx").on(table.uploadedAt),
+  ]
+)
+
+/** Creator display identities, for names and avatars in the creators table. */
+export const sideshiftCreators = pgTable("sideshift_creators", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  avatarUrl: text("avatar_url"),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+})
+
+/** Views and engagement gained per campaign per day, summed from post deltas. */
+export const sideshiftDaily = pgTable(
+  "sideshift_daily",
+  {
+    campaignId: text("campaign_id")
+      .notNull()
+      .references(() => sideshiftCampaigns.id, { onDelete: "cascade" }),
+    date: date("date", { mode: "string" }).notNull(),
+    views: bigint("views", { mode: "number" }).notNull().default(0),
+    likes: bigint("likes", { mode: "number" }).notNull().default(0),
+    comments: bigint("comments", { mode: "number" }).notNull().default(0),
+    shares: bigint("shares", { mode: "number" }).notNull().default(0),
+  },
+  (table) => [primaryKey({ columns: [table.campaignId, table.date] })]
+)
+
+/* -------------------------------------------------------------------------- */
 /* Inferred types                                                              */
 /* -------------------------------------------------------------------------- */
 
@@ -700,3 +841,6 @@ export type DiscordTrigger = typeof discordTriggers.$inferSelect
 export type WebhookEndpoint = typeof webhookEndpoints.$inferSelect
 export type ProviderIntegration = typeof providerIntegrations.$inferSelect
 export type DashboardLayout = typeof dashboardLayouts.$inferSelect
+export type SideshiftConnection = typeof sideshiftConnection.$inferSelect
+export type SideshiftCampaign = typeof sideshiftCampaigns.$inferSelect
+export type SideshiftPost = typeof sideshiftPosts.$inferSelect
