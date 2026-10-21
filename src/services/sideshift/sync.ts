@@ -5,6 +5,7 @@ import {
   sideshiftCampaigns,
   sideshiftCreators,
   sideshiftDaily,
+  sideshiftPostDaily,
   sideshiftPosts,
   type SideshiftCampaign,
   type SideshiftConnection,
@@ -287,6 +288,9 @@ async function syncCampaigns(session: Session): Promise<SideshiftCampaign[]> {
       .set({ removedAt: now, tracked: false, historyBackfilledAt: null, updatedAt: now })
       .where(inArray(sideshiftCampaigns.id, removed))
     await db.delete(sideshiftDaily).where(inArray(sideshiftDaily.campaignId, removed))
+    await db
+      .delete(sideshiftPostDaily)
+      .where(inArray(sideshiftPostDaily.campaignId, removed))
   }
 
   return db.select().from(sideshiftCampaigns)
@@ -680,6 +684,10 @@ async function syncHistory(
 
   const requested = new Set(campaignIds)
   const totals = new Map<string, DailyTotals>()
+  // Per post as well, keyed by our post id, so a creator's share of the
+  // campaign can be charted later. Rows for posts the catalogue sync did not
+  // return are campaign-only: there is nothing to join them to.
+  const postTotals = new Map<string, DailyTotals>()
   const read = (row: string[], index: number | null) => {
     if (index === null) {
       return 0
@@ -699,29 +707,35 @@ async function syncHistory(
     }
 
     const csvCampaign = columns.campaign === null ? null : row[columns.campaign]
-    const campaigns = csvCampaign
-      ? [csvCampaign]
-      : (lookup.get(row[columns.post] ?? "")?.campaignIds ?? [])
+    const post = lookup.get(row[columns.post] ?? "")
+    const campaigns = csvCampaign ? [csvCampaign] : (post?.campaignIds ?? [])
+    const gained = {
+      views: read(row, columns.views),
+      likes: read(row, columns.likes),
+      comments: read(row, columns.comments),
+      shares: read(row, columns.shares),
+    }
 
     for (const campaignId of campaigns) {
       if (!requested.has(campaignId)) {
         continue
       }
 
-      const key = `${campaignId}|${date}`
-      const entry = totals.get(key) ?? { views: 0, likes: 0, comments: 0, shares: 0 }
+      accumulate(totals, `${campaignId}|${date}`, gained)
 
-      entry.views += read(row, columns.views)
-      entry.likes += read(row, columns.likes)
-      entry.comments += read(row, columns.comments)
-      entry.shares += read(row, columns.shares)
-      totals.set(key, entry)
+      if (post) {
+        accumulate(postTotals, `${post.id}|${campaignId}|${date}`, gained)
+      }
     }
   }
 
   const values = Array.from(totals, ([key, entry]) => {
     const [campaignId, date] = key.split("|") as [string, string]
     return { campaignId, date, ...entry }
+  })
+  const postValues = Array.from(postTotals, ([key, entry]) => {
+    const [postId, campaignId, date] = key.split("|") as [string, string, string]
+    return { postId, campaignId, date, ...entry }
   })
 
   await db.transaction(async (tx) => {
@@ -733,16 +747,45 @@ async function syncHistory(
           between(sideshiftDaily.date, fromDate, toDate)
         )
       )
+    await tx
+      .delete(sideshiftPostDaily)
+      .where(
+        and(
+          inArray(sideshiftPostDaily.campaignId, campaignIds),
+          between(sideshiftPostDaily.date, fromDate, toDate)
+        )
+      )
 
     for (let index = 0; index < values.length; index += WRITE_CHUNK) {
       await tx.insert(sideshiftDaily).values(values.slice(index, index + WRITE_CHUNK))
     }
+
+    for (let index = 0; index < postValues.length; index += WRITE_CHUNK) {
+      await tx
+        .insert(sideshiftPostDaily)
+        .values(postValues.slice(index, index + WRITE_CHUNK))
+    }
   })
+}
+
+function accumulate(
+  totals: Map<string, DailyTotals>,
+  key: string,
+  gained: DailyTotals
+) {
+  const entry = totals.get(key) ?? { views: 0, likes: 0, comments: 0, shares: 0 }
+
+  entry.views += gained.views
+  entry.likes += gained.likes
+  entry.comments += gained.comments
+  entry.shares += gained.shares
+  totals.set(key, entry)
 }
 
 /** Clears every cached campaign, post and daily row. */
 export async function clearSideshiftCache() {
   await db.transaction(async (tx) => {
+    await tx.delete(sideshiftPostDaily)
     await tx.delete(sideshiftDaily)
     await tx.delete(sideshiftPosts)
     await tx.delete(sideshiftCreators)
@@ -761,6 +804,7 @@ export async function untrackCampaigns(ids: string[]) {
     .set({ tracked: false, historyBackfilledAt: null, updatedAt: new Date() })
     .where(inArray(sideshiftCampaigns.id, ids))
   await db.delete(sideshiftDaily).where(inArray(sideshiftDaily.campaignId, ids))
+  await db.delete(sideshiftPostDaily).where(inArray(sideshiftPostDaily.campaignId, ids))
 }
 
 export async function trackCampaigns(ids: string[]) {

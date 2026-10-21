@@ -26,6 +26,9 @@ import { validate, validatedQuery } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
 import {
   campaignAnalytics,
+  campaignSeries,
+  SERIES_MAX_CREATORS,
+  SERIES_MAX_DAYS,
   sideshiftStatus,
   type AnalyticsRange,
   type PostSort,
@@ -132,6 +135,59 @@ sideshiftRouter.get(
         postSort: query.sort,
       }),
     })
+  }
+)
+
+/**
+ * Daily views for the dashboard's views-vs-revenue tile. `creators` is a
+ * comma-separated list of creator keys from `/analytics`, each URI-encoded so
+ * a handle with a comma survives the trip.
+ */
+sideshiftRouter.get(
+  "/series",
+  validate({
+    query: z.object({
+      campaign: z.string().trim().min(1).max(240).default("all"),
+      days: z.coerce.number().int().min(7).max(SERIES_MAX_DAYS).default(30),
+      creators: z
+        .string()
+        .max(4000)
+        .default("")
+        .transform((value) =>
+          Array.from(
+            new Set(
+              value
+                .split(",")
+                .map((entry) => entry.trim())
+                .filter(Boolean)
+                .map((entry) => {
+                  try {
+                    return decodeURIComponent(entry)
+                  } catch {
+                    return entry
+                  }
+                })
+            )
+          )
+        )
+        .pipe(z.array(z.string().min(1).max(240)).max(SERIES_MAX_CREATORS)),
+    }),
+  }),
+  async (req, res) => {
+    const query = validatedQuery<{
+      campaign: string
+      days: number
+      creators: string[]
+    }>(req)
+    const row = await loadConnection()
+
+    if (!row || row.status === "disconnected") {
+      throw new NotFoundError("Sideshift connection")
+    }
+
+    startSyncIfDue(row.status)
+
+    res.json({ data: await campaignSeries(query) })
   }
 )
 
