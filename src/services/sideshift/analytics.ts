@@ -5,6 +5,7 @@ import {
   sideshiftCampaigns,
   sideshiftCreators,
   sideshiftDaily,
+  sideshiftPostDaily,
   sideshiftPosts,
 } from "../../db/schema.js"
 import { NotFoundError } from "../../lib/errors.js"
@@ -227,6 +228,181 @@ export async function campaignAnalytics(params: {
 }
 
 export type CampaignAnalytics = Awaited<ReturnType<typeof campaignAnalytics>>
+
+/* -------------------------------------------------------------------------- */
+/* Daily view series                                                           */
+/* -------------------------------------------------------------------------- */
+
+/** Longest window the dashboard's overlay tile may ask for. */
+export const SERIES_MAX_DAYS = 365
+/** Creators one tile may overlay. Keys are `creatorId|platform` creator rows. */
+export const SERIES_MAX_CREATORS = 6
+
+/**
+ * Daily views for the dashboard's views-vs-revenue tile: the campaign total
+ * plus one series per requested creator account, every one on the same
+ * calendar so the tile can line them up under RevenueCat's series.
+ *
+ * Creator keys are the `key` of a creator row from `campaignAnalytics`, so a
+ * tile can be configured from the same list the Marketing tab shows. A key
+ * nothing in the window matches is returned with an empty series rather than
+ * dropped, so the legend still explains what was asked for.
+ */
+export async function campaignSeries(params: {
+  campaign: string
+  days: number
+  creators: string[]
+}) {
+  const tracked = await trackedCampaigns()
+  let ids = tracked.map((campaign) => campaign.id)
+  let campaignName: string | null = null
+
+  if (params.campaign !== "all") {
+    const match = tracked.find((campaign) => campaign.id === params.campaign)
+
+    if (!match) {
+      throw new NotFoundError("Tracked campaign")
+    }
+
+    ids = [match.id]
+    campaignName = match.name
+  }
+
+  const since = utcDay(-(params.days - 1))
+  const empty = fillDays([], since).map(({ date, views }) => ({ date, views }))
+
+  if (ids.length === 0) {
+    return {
+      campaign: params.campaign,
+      campaignName,
+      days: params.days,
+      daily: empty,
+      creators: params.creators.map((key) => ({
+        key,
+        name: null,
+        handle: null,
+        platform: key.split("|").pop() ?? "",
+        avatarUrl: null,
+        daily: empty,
+      })),
+    }
+  }
+
+  const dailyRows = await db
+    .select({
+      date: sideshiftDaily.date,
+      views: sql<string>`sum(${sideshiftDaily.views})`,
+    })
+    .from(sideshiftDaily)
+    .where(and(inArray(sideshiftDaily.campaignId, ids), gte(sideshiftDaily.date, since)))
+    .groupBy(sideshiftDaily.date)
+    .orderBy(asc(sideshiftDaily.date))
+
+  const daily = fillDays(
+    dailyRows.map((row) => ({ date: row.date, views: Number(row.views), engagement: 0 })),
+    since
+  ).map(({ date, views }) => ({ date, views }))
+
+  if (params.creators.length === 0) {
+    return { campaign: params.campaign, campaignName, days: params.days, daily, creators: [] }
+  }
+
+  // One row per creator account per day. The key matches `buildCreators`, so
+  // the id (or handle) and platform identify the same account on both tabs.
+  const creatorRows = await db
+    .select({
+      date: sideshiftPostDaily.date,
+      creatorId: sideshiftPosts.creatorId,
+      creatorHandle: sideshiftPosts.creatorHandle,
+      creatorName: sql<string | null>`max(${sideshiftPosts.creatorName})`,
+      platform: sideshiftPosts.platform,
+      views: sql<string>`sum(${sideshiftPostDaily.views})`,
+    })
+    .from(sideshiftPostDaily)
+    .innerJoin(sideshiftPosts, eq(sideshiftPosts.id, sideshiftPostDaily.postId))
+    .where(
+      and(
+        inArray(sideshiftPostDaily.campaignId, ids),
+        gte(sideshiftPostDaily.date, since)
+      )
+    )
+    .groupBy(
+      sideshiftPostDaily.date,
+      sideshiftPosts.creatorId,
+      sideshiftPosts.creatorHandle,
+      sideshiftPosts.platform
+    )
+
+  const wanted = new Set(params.creators)
+  const groups = new Map<
+    string,
+    {
+      creatorId: string | null
+      handle: string | null
+      name: string | null
+      platform: string
+      rows: { date: string; views: number; engagement: number }[]
+    }
+  >()
+
+  for (const row of creatorRows) {
+    const key = `${row.creatorId ?? row.creatorHandle ?? "unknown"}|${row.platform}`
+
+    if (!wanted.has(key)) {
+      continue
+    }
+
+    const group = groups.get(key) ?? {
+      creatorId: row.creatorId,
+      handle: row.creatorHandle,
+      name: row.creatorName,
+      platform: row.platform,
+      rows: [],
+    }
+
+    group.rows.push({ date: row.date, views: Number(row.views), engagement: 0 })
+    groups.set(key, group)
+  }
+
+  const creatorIds = Array.from(groups.values())
+    .map((group) => group.creatorId)
+    .filter((id): id is string => Boolean(id))
+  const identities =
+    creatorIds.length === 0
+      ? []
+      : await db
+          .select()
+          .from(sideshiftCreators)
+          .where(inArray(sideshiftCreators.id, Array.from(new Set(creatorIds))))
+  const byId = new Map(identities.map((identity) => [identity.id, identity]))
+
+  return {
+    campaign: params.campaign,
+    campaignName,
+    days: params.days,
+    daily,
+    creators: params.creators.map((key) => {
+      const group = groups.get(key)
+      const identity = group?.creatorId ? byId.get(group.creatorId) : undefined
+
+      return {
+        key,
+        name: identity?.name ?? group?.name ?? group?.handle ?? null,
+        handle: group?.handle ?? null,
+        platform: group?.platform ?? (key.split("|").pop() ?? ""),
+        avatarUrl: identity?.avatarUrl ?? null,
+        daily: group
+          ? fillDays(
+              [...group.rows].sort((a, b) => a.date.localeCompare(b.date)),
+              since
+            ).map(({ date, views }) => ({ date, views }))
+          : empty,
+      }
+    }),
+  }
+}
+
+export type CampaignSeries = Awaited<ReturnType<typeof campaignSeries>>
 
 /** One entry per day so the chart shows quiet days as zero, not as gaps. */
 function fillDays(

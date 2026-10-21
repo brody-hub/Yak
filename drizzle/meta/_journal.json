@@ -29,6 +29,13 @@
       "when": 1792508019631,
       "tag": "0003_sideshift_campaign_analytics",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1792545718670,
+      "tag": "0004_sideshift_post_daily",
+      "breakpoints": true
     }
   ]
 }

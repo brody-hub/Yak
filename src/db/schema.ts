@@ -821,6 +821,32 @@ export const sideshiftDaily = pgTable(
   (table) => [primaryKey({ columns: [table.campaignId, table.date] })]
 )
 
+/**
+ * The same daily gains, kept per post so a creator's views can be charted on
+ * their own. The dashboard's views-vs-revenue tile groups these by the post's
+ * creator; `sideshift_daily` stays the campaign total.
+ */
+export const sideshiftPostDaily = pgTable(
+  "sideshift_post_daily",
+  {
+    postId: text("post_id")
+      .notNull()
+      .references(() => sideshiftPosts.id, { onDelete: "cascade" }),
+    campaignId: text("campaign_id")
+      .notNull()
+      .references(() => sideshiftCampaigns.id, { onDelete: "cascade" }),
+    date: date("date", { mode: "string" }).notNull(),
+    views: bigint("views", { mode: "number" }).notNull().default(0),
+    likes: bigint("likes", { mode: "number" }).notNull().default(0),
+    comments: bigint("comments", { mode: "number" }).notNull().default(0),
+    shares: bigint("shares", { mode: "number" }).notNull().default(0),
+  },
+  (table) => [
+    primaryKey({ columns: [table.postId, table.campaignId, table.date] }),
+    index("sideshift_post_daily_campaign_date_idx").on(table.campaignId, table.date),
+  ]
+)
+
 /* -------------------------------------------------------------------------- */
 /* Inferred types                                                              */
 /* -------------------------------------------------------------------------- */

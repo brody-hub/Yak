@@ -144,12 +144,15 @@ local tables, so reads never wait on Sideshift.
 There is no scheduler. Reading `status` or `analytics` starts a background sync
 when the last one began over an hour ago. Every sync holds a Postgres advisory
 lock, so concurrent viewers start at most one. A new campaign backfills 365
-days of daily history; afterwards each sync re-reads the last 3 days.
+days of daily history; afterwards each sync re-reads the last 3 days. History
+is kept per campaign per day and, so a creator's share can be charted, per post
+per day.
 
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/status` | Connection state (`disconnected`, `connected`, `needs_reconnect`, `subscription_inactive`), last sync, whether one is running, last error, and every campaign with its `tracked` flag. |
 | GET | `/analytics?campaign=&range=&sort=` | `campaign` is a tracked id or `all`; `range` is `7d`, `30d` or `all`; `sort` is `views` or `newest`. Returns summary cards, a daily series, creator rows and up to 60 posts. |
+| GET | `/series?campaign=&days=&creators=` | Daily views for the dashboard's views-vs-revenue tile. `campaign` is a tracked id or `all`; `days` is 7–365; `creators` is up to 6 comma-separated creator `key`s from `/analytics`, each URI-encoded. Returns the campaign's daily views plus one daily series per creator, all on the same calendar. |
 | POST | `/refresh` | Starts a sync now. `202`; `429` within a minute of the last one; `409` while the connection needs reconnecting. |
 | PUT | `/campaigns` | `{ tracked: string[] }`. Owner/admin. Newly tracked campaigns sync immediately. |
 | POST | `/connect` | Owner/admin. Registers this deployment with Sideshift on first use, then returns `{ authorizeUrl }` for the browser to open. |
