@@ -98,7 +98,13 @@ publicMetaRouter.use("/media", mediaRouter)
 // Sideshift's OAuth redirect. Authenticated by its one-time `state`, not the
 // session cookie, which lives on the panel's host rather than this one. The
 // auth limiter fits: it is hit once per connect, like a sign-in.
-publicMetaRouter.use(authLimiter, sideshiftCallbackRouter)
+//
+// The limiter is mounted on the callback path only. A pathless `use` would run
+// it for every request through this router, and since this router sits in
+// front of the whole panel API, that throttled all of `/api` at 30 requests per
+// five minutes per IP.
+publicMetaRouter.use("/sideshift/callback", authLimiter)
+publicMetaRouter.use(sideshiftCallbackRouter)
 
 /**
  * Lets the login screen render tenant branding before anyone signs in.
