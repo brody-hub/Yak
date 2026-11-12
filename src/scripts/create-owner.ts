@@ -9,7 +9,7 @@ import { newId } from "../lib/crypto.js"
 import { logger } from "../logger.js"
 import { sendInviteEmail } from "../services/email.js"
 import {
-  createPanelUser,
+  invitePanelUser,
   issueTemporaryPassword,
 } from "../services/panel-accounts.js"
 
@@ -34,21 +34,25 @@ export type ResetPasswordResult =
   | { status: "skipped"; reason: string }
 
 async function emailTaken(email: string) {
+  return Boolean(await emailOwner(email))
+}
+
+async function emailOwner(email: string) {
   const [existing] = await db
-    .select({ id: userTable.id })
+    .select({ id: userTable.id, role: userTable.role })
     .from(userTable)
     .where(eq(userTable.email, email))
     .limit(1)
 
-  return Boolean(existing)
+  return existing ?? null
 }
 
 /**
  * Bootstraps a super admin.
  *
- * There is no public sign-up, so this is how the first account on a fresh
- * deployment comes into existence. That super admin then creates customer
- * accounts and their owners from the admin console.
+ * Staff are never created through sign up, so this is how the first super
+ * admin on a deployment comes into existence. That super admin then manages
+ * customer accounts from the admin console.
  */
 export async function createSuperAdminAccount(options: {
   email: string
@@ -61,11 +65,22 @@ export async function createSuperAdminAccount(options: {
     return { status: "skipped", reason: "No email provided" }
   }
 
-  if (await emailTaken(email)) {
+  const existing = await emailOwner(email)
+
+  if (existing?.role === SUPER_ADMIN_ROLE) {
     return { status: "exists", email }
   }
 
-  const { temporaryPassword } = await createPanelUser({
+  // Emails are unique across all of Yak, and a super admin belongs to no
+  // customer, so a customer's login cannot double as one.
+  if (existing) {
+    return {
+      status: "skipped",
+      reason: `${email} already signs in to a customer account; use a different email for the super admin`,
+    }
+  }
+
+  const { temporaryPassword } = await invitePanelUser({
     tenantId: null,
     email,
     name,
@@ -146,7 +161,7 @@ export async function createOwnerAccount(options: {
 
   await ensureFirstApp(tenant)
 
-  const { temporaryPassword } = await createPanelUser({
+  const { temporaryPassword } = await invitePanelUser({
     tenantId: tenant.id,
     email,
     name,

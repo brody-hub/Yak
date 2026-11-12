@@ -32,7 +32,7 @@ import { validate } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
 import { sendInviteEmail } from "../services/email.js"
 import {
-  createPanelUser,
+  invitePanelUser,
   issueTemporaryPassword,
 } from "../services/panel-accounts.js"
 
@@ -162,7 +162,7 @@ systemUsersRouter.post(
     const tenantId = getTenantId(req)
     await assertSeatAvailable(tenantId)
 
-    const { user: row, temporaryPassword } = await createPanelUser({
+    const { user: row, temporaryPassword } = await invitePanelUser({
       tenantId,
       email: body.email,
       name: body.name,

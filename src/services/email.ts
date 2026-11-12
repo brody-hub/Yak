@@ -268,3 +268,37 @@ export async function sendStaffAddedUserNotice(params: {
     text: `${summary}\n\nIf you did not ask for this, deactivate them under Settings > User management and contact ${env.APP_NAME} support.`,
   })
 }
+
+export async function sendVerifyEmail(params: {
+  to: string
+  name: string
+  verifyUrl: string
+}): Promise<boolean> {
+  const html = layout(
+    "Confirm your email",
+    `<p style="margin:0 0 12px;font-size:14px;line-height:1.6;">
+       Hi ${escapeHtml(params.name)}, thanks for signing up for
+       ${escapeHtml(env.APP_NAME)}. Confirm this is your email address to
+       finish setting up your account. The link expires in 24 hours.
+     </p>
+     ${button(params.verifyUrl, "Confirm email")}
+     <p style="margin:0;font-size:13px;color:#6b7280;line-height:1.6;">
+       If you did not sign up, you can ignore this email.
+     </p>`
+  )
+
+  const text = [
+    `Confirm your email to finish setting up your ${env.APP_NAME} account.`,
+    ``,
+    params.verifyUrl,
+    ``,
+    `The link expires in 24 hours. If you did not sign up, ignore this email.`,
+  ].join("\n")
+
+  return sendEmail({
+    to: params.to,
+    subject: `Confirm your email for ${env.APP_NAME}`,
+    html,
+    text,
+  })
+}

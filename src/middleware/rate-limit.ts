@@ -41,6 +41,17 @@ export const authLimiter = rateLimit({
   ),
 })
 
+/**
+ * Each sign up creates an account and sends an email, so a few per hour from
+ * one address is plenty for a person and little use to a script.
+ */
+export const signupLimiter = rateLimit({
+  ...shared,
+  windowMs: 60 * 60_000,
+  limit: 5,
+  message: jsonLimitResponse("Too many sign ups from here, try again later"),
+})
+
 /** Notes the throttled request against the key before answering 429. */
 function ingestLimitHandler(message: string) {
   return (

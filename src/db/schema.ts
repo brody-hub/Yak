@@ -1,4 +1,4 @@
-import { sql } from "drizzle-orm"
+import { type SQL, sql } from "drizzle-orm"
 import {
   type AnyPgColumn,
   bigint,
@@ -47,6 +47,15 @@ export const planTierEnum = pgEnum("plan_tier", [
 ])
 
 export const appStatusEnum = pgEnum("app_status", ["active", "archived"])
+
+/** How often a paid tier is billed. */
+export const billingIntervalEnum = pgEnum("billing_interval", [
+  "monthly",
+  "annual",
+])
+
+/** Who created the account: Yak staff, or its owner through /signup. */
+export const signupSourceEnum = pgEnum("signup_source", ["admin", "self_serve"])
 
 export const activityActionEnum = pgEnum("activity_action", [
   "signed_in",
@@ -175,11 +184,21 @@ export const tenants = pgTable(
     slug: text("slug").notNull().unique(),
     status: tenantStatusEnum("status").notNull().default("active"),
     /**
-     * The account's tier. Set by hand from the admin console until Stripe is
-     * wired up, after which Stripe's subscription state drives it.
+     * The account's tier. Driven by the Stripe subscription once there is
+     * one; otherwise set by hand from the admin console (Scale contracts).
      */
     plan: planTierEnum("plan").notNull().default("free"),
     stripeCustomerId: text("stripe_customer_id").unique(),
+    stripeSubscriptionId: text("stripe_subscription_id").unique(),
+    /** Stripe's subscription status (active, past_due, canceled, ...). */
+    subscriptionStatus: text("subscription_status"),
+    /**
+     * A paid tier picked at sign up and not yet paid for. The account runs on
+     * `plan` (Free) until checkout completes and the webhook clears this.
+     */
+    pendingPlan: planTierEnum("pending_plan"),
+    pendingInterval: billingIntervalEnum("pending_interval"),
+    signupSource: signupSourceEnum("signup_source").notNull().default("admin"),
     /** Last ticket number handed out; the next ticket gets this plus one. */
     ticketSeq: integer("ticket_seq").notNull().default(100),
     /** Last report number handed out; the next report gets this plus one. */
@@ -236,15 +255,19 @@ const tenantIsolation = (table: string, column: AnyPgColumn) =>
   })
 
 /**
- * Super admins setting up and managing accounts. Granted only on the handful
- * of tables that holds account metadata; never on end user data.
+ * Super admins setting up and managing accounts. Staff manage accounts but
+ * never see or change what is in them, so each grant is the narrowest one the
+ * admin console needs: list an account's apps, create the first app and
+ * branding row with the account, and write (and read back) their own audit
+ * entries. Nothing on end user tables, and no update or delete anywhere but
+ * the tenants row itself. Deleting a tenant still removes everything it owns:
+ * foreign key cascades are not subject to row level security.
  */
-const staffAccess = (table: string) =>
-  pgPolicy(`${table}_staff_access`, {
-    for: "all",
-    using: STAFF_SCOPE,
-    withCheck: STAFF_SCOPE,
-  })
+const staffRead = (table: string, using: SQL = STAFF_SCOPE) =>
+  pgPolicy(`${table}_staff_read`, { for: "select", using })
+
+const staffInsert = (table: string) =>
+  pgPolicy(`${table}_staff_insert`, { for: "insert", withCheck: STAFF_SCOPE })
 
 /** A credential being resolved by hash before its tenant is known. */
 const lookupAccess = (table: string) =>
@@ -285,7 +308,8 @@ export const apps = pgTable(
     // row can never point at another tenant's app.
     unique("apps_tenant_id_id_unique").on(table.tenantId, table.id),
     tenantIsolation("apps", table.tenantId),
-    staffAccess("apps"),
+    staffRead("apps"),
+    staffInsert("apps"),
     // An API key's app status is read in the same lookup as the key.
     lookupAccess("apps"),
   ]
@@ -465,7 +489,9 @@ export const activityLog = pgTable(
       table.createdAt
     ),
     tenantIsolation("activity_log", table.tenantId),
-    staffAccess("activity_log"),
+    // Only staff's own entries: a customer's trail describes their data.
+    staffRead("activity_log", sql`${STAFF_SCOPE} and ${table.section} = 'admin'`),
+    staffInsert("activity_log"),
   ]
 )
 
@@ -842,7 +868,7 @@ export const appSettings = pgTable(
   },
   (table) => [
     tenantIsolation("app_settings", table.tenantId),
-    staffAccess("app_settings"),
+    staffInsert("app_settings"),
   ]
 )
 

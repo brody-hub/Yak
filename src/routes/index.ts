@@ -1,5 +1,6 @@
 import { type RequestHandler, Router } from "express"
 
+import { PLANS } from "../billing/plans.js"
 import { env } from "../env.js"
 import { serializeSettings } from "../lib/serializers.js"
 import {
@@ -21,6 +22,7 @@ import {
   ingestAuthLimiter,
   panelAuthLimiter,
   panelLimiter,
+  signupLimiter,
   uploadLimiter,
 } from "../middleware/rate-limit.js"
 import { activityRouter } from "./activity.js"
@@ -42,6 +44,7 @@ import { publicUsersRouter } from "./public/users.js"
 import { reportsRouter } from "./reports.js"
 import { loadSettings, settingsRouter } from "./settings.js"
 import { sideshiftCallbackRouter, sideshiftRouter } from "./sideshift.js"
+import { signupRouter } from "./signup.js"
 import { systemUsersRouter } from "./system-users.js"
 import { tasksRouter } from "./tasks.js"
 import { uploadsRouter } from "./uploads.js"
@@ -185,8 +188,11 @@ publicMetaRouter.use("/media", mediaRouter)
 publicMetaRouter.use("/sideshift/callback", authLimiter)
 publicMetaRouter.use(sideshiftCallbackRouter)
 
+// Self-serve sign up. Path-specific for the same reason as the callback.
+publicMetaRouter.use("/signup", signupLimiter, signupRouter)
+
 /**
- * What the login screen needs before anyone signs in.
+ * What the landing, sign up and login screens need before anyone signs in.
  *
  * One deployment now serves every customer and the login screen cannot know
  * which one is signing in, so it shows the product's own branding. A tenant's
@@ -197,8 +203,10 @@ publicMetaRouter.get("/config", (_req, res) => {
     data: {
       tenantName: env.APP_NAME,
       tenantSlug: null,
-      signUpEnabled: false,
+      signUpEnabled: env.signupEnabled,
+      paymentsEnabled: env.stripe.configured,
       passwordMinLength: 12,
+      plans: PLANS,
       branding: {
         brandName: env.APP_NAME,
         logoUrl: null,

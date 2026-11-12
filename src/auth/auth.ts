@@ -10,6 +10,7 @@ import { logger } from "../logger.js"
 import {
   sendPasswordChangedEmail,
   sendPasswordResetEmail,
+  sendVerifyEmail,
 } from "../services/email.js"
 
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
@@ -34,11 +35,12 @@ export const auth = betterAuth({
 
   emailAndPassword: {
     enabled: true,
-    // This panel is invite only. Accounts are created by a super admin
-    // (/api/admin) or a tenant's owner or admin (/api/system-users), never by
-    // the person signing in.
+    // Better Auth's own sign up knows nothing about tenants. Accounts are
+    // created by /api/signup (a new owner with their account), a super admin
+    // (/api/admin), or a tenant's owner or admin (/api/system-users).
     disableSignUp: true,
-    requireEmailVerification: false,
+    // Only sign ups start unverified; invites are verified by being used.
+    requireEmailVerification: true,
     minPasswordLength: 12,
     maxPasswordLength: 128,
     resetPasswordTokenExpiresIn: 60 * 60,
@@ -62,6 +64,29 @@ export const auth = betterAuth({
       await sendPasswordChangedEmail({ to: user.email }).catch((error) => {
         logger.warn({ err: error }, "Password change notification failed")
       })
+    },
+  },
+
+  emailVerification: {
+    // Signing in unverified answers 403 and sends a fresh link.
+    sendOnSignIn: true,
+    // The link opens the panel, which calls verify-email itself, so the
+    // session cookie lands in the panel's partition like any other sign in.
+    autoSignInAfterVerification: true,
+    expiresIn: 60 * 60 * 24,
+    sendVerificationEmail: async ({ user, token }) => {
+      const verifyUrl = `${env.APP_URL}/verify-email?token=${encodeURIComponent(token)}`
+
+      const sent = await sendVerifyEmail({
+        to: user.email,
+        name: user.name,
+        verifyUrl,
+      })
+
+      if (!sent && !env.email.configured && !env.isProduction) {
+        // Local development only: there is no inbox to click through.
+        logger.info({ to: user.email, verifyUrl }, "Email verification link")
+      }
     },
   },
 
@@ -136,6 +161,8 @@ export const auth = betterAuth({
       "/request-password-reset": { window: 600, max: 5 },
       "/reset-password": { window: 600, max: 10 },
       "/change-password": { window: 600, max: 10 },
+      "/send-verification-email": { window: 600, max: 5 },
+      "/verify-email": { window: 600, max: 20 },
     },
   },
 

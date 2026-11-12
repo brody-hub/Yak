@@ -90,6 +90,13 @@ const schema = z.object({
     urlNoTrailingSlash.default("https://app.sideshift.app")
   ),
 
+  // Public self-serve sign up at /signup. Off unless set explicitly, and only
+  // takes effect once email is configured, since a new owner has to confirm
+  // their address before they can sign in.
+  SIGNUP_ENABLED: z
+    .preprocess(emptyToUndefined, z.enum(["true", "false"]).default("false"))
+    .transform((value) => value === "true"),
+
   // First-boot super admin, created only when no super admin exists yet.
   SUPER_ADMIN_EMAIL: z.preprocess(
     emptyToUndefined,
@@ -97,8 +104,7 @@ const schema = z.object({
   ),
   SUPER_ADMIN_NAME: z.preprocess(emptyToUndefined, z.string().optional()),
 
-  // Stripe. Read and validated now so the keys can be provisioned ahead of
-  // billing; nothing calls Stripe yet. Live keys are refused outside
+  // Stripe subscriptions for the paid tiers. Live keys are refused outside
   // production so a test deployment cannot charge anyone.
   STRIPE_SECRET_KEY: z.preprocess(
     emptyToUndefined,
@@ -217,6 +223,19 @@ export const env = {
     publishableKey: raw.STRIPE_PUBLISHABLE_KEY,
     webhookSecret: raw.STRIPE_WEBHOOK_SECRET,
   },
+  /**
+   * Whether /signup accepts new accounts: switched on, and able to send the
+   * verification email a new owner needs before they can sign in. Outside
+   * production the link is logged instead, so the flow can be tested locally.
+   */
+  signupEnabled:
+    raw.SIGNUP_ENABLED &&
+    (raw.NODE_ENV !== "production" ||
+      Boolean(
+        raw.CLOUDFLARE_ACCOUNT_ID &&
+        raw.CLOUDFLARE_EMAIL_API_TOKEN &&
+        raw.EMAIL_FROM
+      )),
   /** Alias of `r2.configured` for boot logs that still say "images". */
   images: {
     configured: Boolean(

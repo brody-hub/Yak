@@ -14,7 +14,19 @@ const AUTH_ENDPOINTS = new Set([
   "GET /api/auth/get-session",
   "POST /api/auth/request-password-reset",
   "POST /api/auth/reset-password",
+  "POST /api/auth/send-verification-email",
+  "GET /api/auth/verify-email",
 ])
+
+/**
+ * The query parameters an endpoint may receive; every other parameter, and
+ * the whole query string of any other endpoint, is dropped. verify-email gets
+ * its token and nothing else: without a `callbackURL` it answers in JSON
+ * rather than redirecting, so no caller can turn it into an open redirect.
+ */
+const ALLOWED_QUERY: Record<string, readonly string[]> = {
+  "GET /api/auth/verify-email": ["token"],
+}
 
 /** Sign in and reset bodies are a few hundred bytes. */
 const MAX_BODY_BYTES = 16 * 1024
@@ -69,7 +81,7 @@ function notFound(res: Parameters<RequestHandler>[1]) {
  * any endpoint (`Host: x/api/auth/update-user?`), and dot segments or `%2e` in
  * the path are resolved the same way. So the Request is built here instead:
  * the path must exactly equal an allowlisted one, the origin is always
- * API_URL, and the query string is dropped.
+ * API_URL, and the query string is dropped apart from ALLOWED_QUERY.
  */
 export const betterAuthHandler: RequestHandler = async (req, res, next) => {
   try {
@@ -88,6 +100,16 @@ export const betterAuthHandler: RequestHandler = async (req, res, next) => {
     if (url.pathname !== rawPath || url.origin !== new URL(env.API_URL).origin) {
       notFound(res)
       return
+    }
+
+    const incoming = new URLSearchParams(req.originalUrl.split("?")[1] ?? "")
+
+    for (const name of ALLOWED_QUERY[key] ?? []) {
+      const value = incoming.get(name)
+
+      if (value !== null) {
+        url.searchParams.set(name, value)
+      }
     }
 
     const headers = new Headers()
