@@ -138,15 +138,32 @@ that account with Sideshift as its own OAuth client whose callback is
 address. If `API_URL` changes later, the next Connect registers again.
 `SIDESHIFT_URL` exists only to point at a mock in tests; leave it unset.
 
-**Stripe** is provisioned ahead of billing: the three keys are read and
-validated on boot, but nothing calls Stripe yet and account tiers are set by
-hand from the admin console. Create the keys in the Stripe dashboard under
-Developers → API keys, and the webhook secret under Developers → Webhooks once
-an endpoint exists. Use **test mode** keys everywhere except production; a
-live secret key (`sk_live_`) is refused unless `NODE_ENV=production`, and the
-publishable key must be from the same mode as the secret key. Treat
-`STRIPE_SECRET_KEY` like `ENCRYPTION_KEY`: Railway variables only, never in a
-repository.
+**Stripe** bills the paid tiers. Use **test mode** keys everywhere except
+production; a live secret key (`sk_live_`) is refused unless
+`NODE_ENV=production`, and the publishable key must be from the same mode as
+the secret key. Treat `STRIPE_SECRET_KEY` like `ENCRYPTION_KEY`: Railway
+variables only, never in a repository. To set it up, in this order:
+
+1. Set `STRIPE_SECRET_KEY` and `STRIPE_PUBLISHABLE_KEY` (Developers → API
+   keys) and deploy.
+2. Run `npm run stripe:sync-prices` from the Railway shell. It creates a
+   product per paid tier and its monthly and annual prices from
+   `src/billing/plans.ts`, under lookup keys like `yak_growth_monthly`. Run it
+   again whenever prices in `plans.ts` change.
+3. Developers → Webhooks → Add endpoint: `API_URL/api/stripe/webhook`, with
+   events `checkout.session.completed`, `customer.subscription.created`,
+   `customer.subscription.updated`, `customer.subscription.deleted`,
+   `customer.subscription.paused`, `customer.subscription.resumed` and
+   `invoice.payment_failed`. Set its signing secret as
+   `STRIPE_WEBHOOK_SECRET`. Checkout is only offered once all three keys are
+   set.
+4. Settings → Billing → Customer portal: allow switching between the Yak
+   products, updating payment methods, and cancelling.
+
+**Self-serve sign up** is off until `SIGNUP_ENABLED=true`, and in production
+also needs email configured (new owners confirm their address before they can
+sign in). Set up Stripe first if paid tiers should be offered at sign up;
+without it, sign up offers Free only.
 
 ## 4. Frontend service
 
@@ -158,12 +175,14 @@ VITE_API_URL=https://your-api.up.railway.app
 
 ## 5. Bootstrap the first super admin
 
-There is no sign-up. One deployment serves every customer account, and a
-**super admin** (Yak staff) creates those accounts from the admin console at
-`APP_URL/admin`.
+One deployment serves every customer account. Customers create their own
+through `/signup` when it is enabled, and a **super admin** (Yak staff)
+manages accounts from the admin console at `APP_URL/admin`.
 
-With `SUPER_ADMIN_EMAIL` set, the first boot creates that super admin. Or run
-from the Railway shell:
+With `SUPER_ADMIN_EMAIL` set, the first boot creates that super admin. The
+email must not already sign in to a customer account (emails are unique across
+all of Yak); if it does, the boot log says so and no super admin is created.
+Or run from the Railway shell:
 
 ```bash
 npm run create:super-admin -- you@yourdomain.com "Your Name"
@@ -173,14 +192,18 @@ The temporary password is emailed. If email is not configured yet, the boot log
 or the command prints it. Signing in forces an immediate password change.
 
 From the admin console a super admin creates an account (name, slug, and its
-first owner, who gets an invite), sets its pricing tier, adds more users to
-it, and can suspend, reactivate, or delete it. Creating an account also
+first owner, who gets an invite), sees its usage as counts (end users,
+events, reports, API keys, last activity), sets its tier when it does not pay
+through Stripe, and can suspend, reactivate, or delete it. Creating an account also
 creates its first app, named after it; the owner renames it and adds more from
 the panel. Suspending blocks the account's panel and ingest API immediately
 without deleting anything. Super admins cannot open a customer's panel or read
 its data: their requests run in a database scope that the row level security
-policies only admit to account metadata (apps, settings, activity), never to
-end user tables.
+policies only let list apps, create an account's first app and branding, and
+write their own audit entries, never touch end user tables, and never change
+anything inside an account. Usage counts come from a database function that
+returns numbers only. Staff can add a login to an account only while nobody
+has ever signed in to it.
 
 To add an owner to an existing account from the shell:
 

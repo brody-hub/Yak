@@ -15,10 +15,11 @@ Every customer-owned row carries `tenant_id`, every query filters on the
 tenant taken from the session or API key, and Postgres **row level security**
 enforces the same thing underneath: each request runs on a connection bound to
 its tenant, and a query that forgot its filter returns nothing rather than
-another customer's rows. Yak staff sign in as **super admins** to create and
-manage accounts; their requests run in a staff scope that the policies only
-admit to account metadata, never to end user tables, so they cannot see inside
-an account even by mistake.
+another customer's rows. Customers sign up at `/signup` (when
+`SIGNUP_ENABLED`) and pay for paid tiers through Stripe. Yak staff sign in as
+**super admins** to manage accounts; their requests run in a staff scope that
+the policies only admit to account metadata, never to end user tables, so they
+cannot see inside an account even by mistake. They see usage as counts only.
 
 ## What it does
 
@@ -82,6 +83,7 @@ panel forces you to replace it on first sign in.
 | `npm run db:studio` | Browse the database. |
 | `npm run seed` | `-- <account-slug>` inserts demo data into that account (default: the oldest). No-op if it already has data. |
 | `npm run create:super-admin` | Bootstrap a super admin. `-- email --reset` reissues a password. |
+| `npm run stripe:sync-prices` | Creates or updates the Stripe products and prices for the paid tiers from `src/billing/plans.ts`. |
 | `npm run create:owner` | `-- <account-slug> email "Name"` adds an owner to an account. |
 
 ## Layout

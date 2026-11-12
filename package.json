@@ -19,7 +19,8 @@
     "db:studio": "drizzle-kit studio",
     "seed": "tsx src/scripts/seed.ts",
     "create:owner": "tsx src/scripts/create-owner.ts",
-    "create:super-admin": "tsx src/scripts/create-owner.ts --super-admin"
+    "create:super-admin": "tsx src/scripts/create-owner.ts --super-admin",
+    "stripe:sync-prices": "tsx src/scripts/stripe-sync-prices.ts"
   },
   "keywords": [],
   "author": "",
@@ -38,6 +39,7 @@
     "pg": "^8.22.0",
     "pino": "^10.3.1",
     "pino-http": "^11.0.0",
+    "stripe": "^23.1.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

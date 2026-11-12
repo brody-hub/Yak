@@ -45,7 +45,14 @@ function startOfUtcMonth(date: Date, monthsAgo = 0): Date {
 
 export async function describeBilling(tenantId: string) {
   const [tenant] = await db
-    .select({ plan: tenants.plan, stripeCustomerId: tenants.stripeCustomerId })
+    .select({
+      plan: tenants.plan,
+      stripeCustomerId: tenants.stripeCustomerId,
+      stripeSubscriptionId: tenants.stripeSubscriptionId,
+      subscriptionStatus: tenants.subscriptionStatus,
+      pendingPlan: tenants.pendingPlan,
+      pendingInterval: tenants.pendingInterval,
+    })
     .from(tenants)
     .where(eq(tenants.id, tenantId))
     .limit(1)
@@ -92,5 +99,11 @@ export async function describeBilling(tenantId: string) {
       suggestedPlanId: tierForMau(billableMau).id,
     },
     hasPaymentMethod: Boolean(tenant.stripeCustomerId),
+    /** Stripe holds this account's billing; plan changes go through its portal. */
+    hasSubscription: Boolean(tenant.stripeSubscriptionId),
+    subscriptionStatus: tenant.subscriptionStatus,
+    /** A paid tier picked at sign up and not yet paid for. */
+    pendingPlan: tenant.pendingPlan,
+    pendingInterval: tenant.pendingInterval,
   }
 }

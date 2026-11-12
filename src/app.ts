@@ -14,6 +14,7 @@ import { logger } from "./logger.js"
 import { errorHandler, notFoundHandler } from "./middleware/error.js"
 import { authLimiter } from "./middleware/rate-limit.js"
 import { apiRouter, publicMetaRouter } from "./routes/index.js"
+import { stripeWebhookRouter } from "./routes/stripe-webhook.js"
 
 export function createApp(): Express {
   const app = express()
@@ -112,6 +113,10 @@ export function createApp(): Express {
   // the JSON body parser claims it. Only an allowlist of its endpoints is
   // reachable; see betterAuthHandler for why the request is rebuilt.
   app.use("/api/auth", authLimiter, betterAuthHandler)
+
+  // Stripe signs the raw body, so its webhook also comes before the parser.
+  // Authenticated by that signature; Stripe sends no Origin header.
+  app.use("/api/stripe/webhook", stripeWebhookRouter)
 
   app.use(express.json({ limit: "1mb" }))
   app.use(cookieParser())

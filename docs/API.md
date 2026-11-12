@@ -23,7 +23,9 @@ Paginated endpoints return:
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/health` | Liveness plus a database check. `503` if the database is unreachable. |
-| GET | `/api/config` | Product name and password policy, for the login screen. The same for every tenant, since the login screen cannot know which one is signing in. |
+| GET | `/api/config` | Product name, password policy, `signUpEnabled`, `paymentsEnabled` and the public `plans` ladder, for the landing, sign up and login screens. The same for every tenant, since those screens cannot know which one is signing in. |
+| POST | `/api/signup` | `{ accountName, name, email, password, plan?, interval? }`. Self-serve sign up; `404` unless `SIGNUP_ENABLED`. Creates the account on Free with its first app and its owner (unverified), and emails a confirmation link. A paid `plan` (`starter` to `studio`) is kept as the account's pending plan and paid for through checkout after sign in; `scale` is refused. `409` if the email is taken, unless it belongs to a sign up left unconfirmed for over 24 hours, which is removed. Limited to 5 per hour per IP. |
+| POST | `/api/stripe/webhook` | Stripe's webhook, authenticated by its signature. Handles `checkout.session.completed` and `customer.subscription.*` by re-reading the subscription and copying its tier and status onto the account. |
 | GET | `/api/sideshift/callback` | Sideshift's OAuth redirect. Authenticated by the one-time `state` from `POST /api/sideshift/connect`, not the session. Parks the authorization code and redirects to `APP_URL/marketing?sideshift=confirm&sideshift_state=…`, where the user who clicked Connect finishes with `POST /api/sideshift/complete`. On failure redirects to `APP_URL/marketing?sideshift=<outcome>`. |
 
 ## Auth (`/api/auth/*`, handled by Better Auth)
@@ -41,8 +43,13 @@ its admin plugin) answers `404`, and the request is rebuilt server side so
 | GET | `/api/auth/get-session` | Current session, or `null`. |
 | POST | `/api/auth/request-password-reset` | `{ email, redirectTo }`. Always succeeds, so it cannot be used to enumerate accounts. |
 | POST | `/api/auth/reset-password` | `{ token, newPassword }`. Revokes all other sessions. |
+| POST | `/api/auth/send-verification-email` | `{ email }`. Sends a fresh confirmation link to an unconfirmed sign up. Always succeeds. |
+| GET | `/api/auth/verify-email?token=…` | Confirms the email from a sign up link and signs the owner in. Called by the panel's `/verify-email` page, never opened on the API host, so the session cookie lands in the panel's partition. Any `callbackURL` is dropped. |
 
-There is no sign-up endpoint. Accounts exist only by invitation.
+Signing in requires a confirmed email. Invited logins are confirmed by the
+invite; a sign up gets `403 EMAIL_NOT_VERIFIED` and a fresh link until the
+owner opens one. Better Auth's own sign up endpoint stays closed:
+`/api/signup` creates the account and owner together.
 
 ## Tenancy, apps and isolation
 
@@ -86,12 +93,15 @@ sections below: `/reports`, `/analytics`, `/kpis`, `/app-users`,
 
 ## Billing (`/api/billing`)
 
-Requires the `owner` or `admin` role. Stripe is not connected yet, so this is
-read only.
+Requires the `owner` or `admin` role. The tier only changes through Stripe:
+these routes send the customer there, and the webhook brings the result back.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/` | `plan` (the account's tier with its limits), `plans` (the whole ladder), `usage` (`currentMonthMau`, `previousMonthMau`, `billableMau`, `suggestedPlanId`), `hasPaymentMethod`, `paymentsEnabled`. |
+| GET | `/` | `plan` (the account's tier with its limits), `plans` (the whole ladder), `usage` (`currentMonthMau`, `previousMonthMau`, `billableMau`, `suggestedPlanId`), `hasPaymentMethod`, `hasSubscription`, `subscriptionStatus`, `pendingPlan`, `pendingInterval`, `paymentsEnabled`. |
+| POST | `/checkout` | `{ plan?, interval? }`, defaulting to the plan picked at sign up. Returns `{ url }` of a Stripe Checkout for that tier. `409` while a subscription is live (use the portal), `503` until Stripe is configured. |
+| POST | `/portal` | Returns `{ url }` of Stripe's customer portal: change tier, update the card, see invoices, cancel. |
+| DELETE | `/pending` | Forgets the paid tier picked at sign up; the account stays on Free. |
 
 MAU is one unique end user with at least one event in a UTC calendar month,
 added up across all of the account's apps. `billableMau` is the peak of the
@@ -99,22 +109,29 @@ last two full months.
 
 ## Account management (`/api/admin`, super admins only)
 
-Super admins set accounts up; they never see what an account's apps sent. The
-staff database scope their requests run in can read account metadata (apps,
-settings, activity) and nothing from the end user tables, so that holds even
-if a route here were wrong.
+Super admins manage accounts; they never see or change what is in them. The
+staff database scope their requests run in can list an account's apps, create
+an account's first app and branding row, and read and write its own audit
+entries, and nothing else: no end user table, no other customer's activity,
+and no update or delete on anything but the account row itself. That holds
+even if a route here were wrong.
+
+Usage figures come from the `staff_app_usage` database function, which counts
+on the database side and returns only numbers and timestamps per app, so staff
+see how much an account uses Yak without seeing any end user or what they
+sent.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/api/admin/tenants` | Every account with `status`, `plan`, owners, user count, `appCount`, `apps` (`{ id, name, status }`), and last sign in. |
+| GET | `/api/admin/tenants` | Every account with `status`, `plan`, `subscriptionStatus`, `pendingPlan`, `signupSource`, owners, user count, `appCount`, `apps` (`{ id, name, status, usage }`), `usage` (the apps added up), and last team sign in. `usage` is `syncedUsers`, `eventsTotal`, `eventsThisMonth`, `activeUsersThisMonth`, `lastEventAt`, `reportsTotal`, `reportsOpen`, `reportsThisMonth`, `activeApiKeys`, `apiKeyLastUsedAt` and `integrations`. |
 | POST | `/api/admin/tenants` | `{ name, slug, ownerName, ownerEmail }`. Creates the account, its first app (named after the account), and invites its owner. `meta` carries `inviteEmailSent` and `temporaryPassword`. |
 | GET | `/api/admin/tenants/:id` | The account and its panel users. |
 | PATCH | `/api/admin/tenants/:id` | `{ name }`. The slug is fixed. |
-| PATCH | `/api/admin/tenants/:id/plan` | `{ plan }`, one of `free`, `starter`, `growth`, `pro`, `studio`, `scale`. Places the account on a tier by hand until Stripe drives it. |
+| PATCH | `/api/admin/tenants/:id/plan` | `{ plan }`, one of `free`, `starter`, `growth`, `pro`, `studio`, `scale`. Places the account on a tier by hand (Scale contracts, accounts paying outside Stripe) and clears any pending plan. `409` while a Stripe subscription is live, since the customer pays for that tier. |
 | POST | `/api/admin/tenants/:id/suspend` | `{ reason? }`. Blocks the panel and ingest API; deletes nothing. |
 | POST | `/api/admin/tenants/:id/reactivate` | Lifts a suspension. |
 | DELETE | `/api/admin/tenants/:id` | `{ confirmSlug }`. Only while suspended. Deletes the account and everything it owns. |
-| POST | `/api/admin/tenants/:id/users` | `{ name, email, role }`. Account recovery only: `403` while the account has an active owner, since owners add their own teammates from the panel and staff must never be able to sign in to a customer's account. Not held to the plan's seat limit. |
+| POST | `/api/admin/tenants/:id/users` | `{ name, email, role }`. Account recovery only: `403` while the account has an active owner, since owners add their own teammates from the panel, and `403` once anyone has ever signed in to the account, since a login staff hand out could then see its data. Not held to the plan's seat limit. |
 | POST | `/api/admin/tenants/:id/users/:userId/resend-invite` | Issues a fresh temporary password and emails it. `409` once the user has signed in; after that only the password reset email can change it. The password is never returned to staff; if the email fails, `meta.inviteEmailSent` is `false` and the invite is resent once email works. |
 | GET | `/api/admin/super-admins` | Every super admin. |
 | POST | `/api/admin/super-admins` | `{ name, email }`. Invites a super admin. |

@@ -1,4 +1,14 @@
-import { and, asc, count, desc, eq, inArray, max } from "drizzle-orm"
+import {
+  and,
+  asc,
+  count,
+  desc,
+  eq,
+  inArray,
+  isNotNull,
+  max,
+  sql,
+} from "drizzle-orm"
 import { Router } from "express"
 import { z } from "zod"
 
@@ -8,14 +18,12 @@ import { PLAN_IDS } from "../billing/plans.js"
 import { db } from "../db/index.js"
 import {
   apps,
-  appSettings,
   session as sessionTable,
   type PlanTier,
   type Tenant,
   tenants,
   user as userTable,
 } from "../db/schema.js"
-import { newId } from "../lib/crypto.js"
 import {
   BadRequestError,
   ConflictError,
@@ -28,16 +36,25 @@ import { validate } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
 import { sendInviteEmail, sendStaffAddedUserNotice } from "../services/email.js"
 import {
-  createPanelUser,
+  invitePanelUser,
   issueTemporaryPassword,
 } from "../services/panel-accounts.js"
-import { loadTenant } from "../services/tenants.js"
+import { hasLiveSubscription } from "../services/stripe.js"
+import {
+  assertEmailFree,
+  createTenantWithFirstApp,
+  loadTenant,
+  tenantSlugSchema,
+  tenantSlugTaken,
+} from "../services/tenants.js"
 
 /**
  * Account management for Yak staff, mounted behind requireSuperAdmin.
  *
- * A super admin creates customer accounts (tenants), staffs them, and
- * suspends or deletes them. Nothing here reads a customer's panel data.
+ * A super admin creates customer accounts (tenants), places them on a tier,
+ * and suspends or deletes them. Staff manage accounts but never see or change
+ * what is in them: nothing here reads a customer's panel data, and the staff
+ * database scope could not if it tried (see staffRead in db/schema.ts).
  */
 export const adminRouter: Router = Router()
 
@@ -46,25 +63,121 @@ const idParamSchema = z.object({ id: z.string().min(1) })
 /** How Yak staff are named to customers, in emails and activity alike. */
 const STAFF_NAME = `${env.APP_NAME} support`
 
-/** Slugs in URLs and paths that a tenant should never be able to claim. */
-const RESERVED_SLUGS = new Set(["admin", "api", "app", "www", "yak", "default"])
-
-const slugSchema = z
-  .string()
-  .trim()
-  .toLowerCase()
-  .regex(
-    /^[a-z0-9][a-z0-9-]{1,39}$/,
-    "Use 2 to 40 lowercase letters, numbers, or dashes, starting with a letter or number"
-  )
-  .refine((value) => !RESERVED_SLUGS.has(value), "That slug is reserved")
-
 const nameSchema = z.string().trim().min(1).max(120)
 const emailSchema = z.string().trim().toLowerCase().email()
 
 /* -------------------------------------------------------------------------- */
 /* Serialization                                                               */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * How much an app uses Yak, as counts and timestamps only. Read through the
+ * `staff_app_usage` database function, because the staff scope cannot read
+ * end user tables: the function aggregates on its side and never returns a
+ * row, so who an account's users are and what they sent stays out of reach.
+ */
+type AppUsage = {
+  syncedUsers: number
+  eventsTotal: number
+  eventsThisMonth: number
+  /** Distinct end users with an event this calendar month (UTC). */
+  activeUsersThisMonth: number
+  lastEventAt: string | null
+  reportsTotal: number
+  reportsOpen: number
+  reportsThisMonth: number
+  activeApiKeys: number
+  apiKeyLastUsedAt: string | null
+  integrations: string[]
+}
+
+type AppUsageRow = {
+  tenant_id: string
+  app_id: string
+  synced_users: string
+  events_total: string
+  events_this_month: string
+  active_users_this_month: string
+  last_event_at: Date | string | null
+  reports_total: string
+  reports_open: string
+  reports_this_month: string
+  active_api_keys: string
+  api_key_last_used_at: Date | string | null
+  integrations: string[] | null
+}
+
+const EMPTY_USAGE: AppUsage = {
+  syncedUsers: 0,
+  eventsTotal: 0,
+  eventsThisMonth: 0,
+  activeUsersThisMonth: 0,
+  lastEventAt: null,
+  reportsTotal: 0,
+  reportsOpen: 0,
+  reportsThisMonth: 0,
+  activeApiKeys: 0,
+  apiKeyLastUsedAt: null,
+  integrations: [],
+}
+
+function isoOrNull(value: Date | string | null) {
+  return value === null ? null : new Date(value).toISOString()
+}
+
+function latest(a: string | null, b: string | null) {
+  if (!a) return b
+  if (!b) return a
+  return a > b ? a : b
+}
+
+async function loadAppUsage(tenantIds: string[]) {
+  const result = await db.execute<AppUsageRow>(
+    sql`select * from staff_app_usage(${sql.param(tenantIds)}::text[])`
+  )
+
+  return new Map(
+    result.rows.map((row) => [
+      row.app_id,
+      {
+        syncedUsers: Number(row.synced_users),
+        eventsTotal: Number(row.events_total),
+        eventsThisMonth: Number(row.events_this_month),
+        activeUsersThisMonth: Number(row.active_users_this_month),
+        lastEventAt: isoOrNull(row.last_event_at),
+        reportsTotal: Number(row.reports_total),
+        reportsOpen: Number(row.reports_open),
+        reportsThisMonth: Number(row.reports_this_month),
+        activeApiKeys: Number(row.active_api_keys),
+        apiKeyLastUsedAt: isoOrNull(row.api_key_last_used_at),
+        integrations: row.integrations ?? [],
+      } satisfies AppUsage,
+    ])
+  )
+}
+
+/** An account's usage is its apps' added up. */
+function sumUsage(items: AppUsage[]): AppUsage {
+  return items.reduce<AppUsage>(
+    (total, item) => ({
+      syncedUsers: total.syncedUsers + item.syncedUsers,
+      eventsTotal: total.eventsTotal + item.eventsTotal,
+      eventsThisMonth: total.eventsThisMonth + item.eventsThisMonth,
+      activeUsersThisMonth:
+        total.activeUsersThisMonth + item.activeUsersThisMonth,
+      lastEventAt: latest(total.lastEventAt, item.lastEventAt),
+      reportsTotal: total.reportsTotal + item.reportsTotal,
+      reportsOpen: total.reportsOpen + item.reportsOpen,
+      reportsThisMonth: total.reportsThisMonth + item.reportsThisMonth,
+      activeApiKeys: total.activeApiKeys + item.activeApiKeys,
+      apiKeyLastUsedAt: latest(total.apiKeyLastUsedAt, item.apiKeyLastUsedAt),
+      integrations: Array.from(
+        new Set([...total.integrations, ...item.integrations])
+      ).sort(),
+    }),
+    EMPTY_USAGE
+  )
+}
 
 async function describeTenants(rows: Tenant[]) {
   if (rows.length === 0) {
@@ -106,13 +219,20 @@ async function describeTenants(rows: Tenant[]) {
     .where(inArray(apps.tenantId, ids))
     .orderBy(asc(apps.createdAt))
 
+  const appUsage = await loadAppUsage(ids)
+
   const usageByTenant = new Map(usage.map((row) => [row.tenantId, row]))
 
   return rows.map((row) => {
     const stats = usageByTenant.get(row.id)
     const tenantApps = appRows
       .filter((app) => app.tenantId === row.id)
-      .map(({ id, name, status }) => ({ id, name, status }))
+      .map(({ id, name, status }) => ({
+        id,
+        name,
+        status,
+        usage: appUsage.get(id) ?? EMPTY_USAGE,
+      }))
 
     return {
       id: row.id,
@@ -120,6 +240,9 @@ async function describeTenants(rows: Tenant[]) {
       slug: row.slug,
       status: row.status,
       plan: row.plan,
+      subscriptionStatus: row.subscriptionStatus,
+      pendingPlan: row.pendingPlan,
+      signupSource: row.signupSource,
       suspendedAt: row.suspendedAt?.toISOString() ?? null,
       suspendedReason: row.suspendedReason,
       createdAt: row.createdAt.toISOString(),
@@ -129,6 +252,7 @@ async function describeTenants(rows: Tenant[]) {
         .map(({ id, name, email }) => ({ id, name, email })),
       appCount: tenantApps.length,
       apps: tenantApps,
+      usage: sumUsage(tenantApps.map((app) => app.usage)),
       lastActiveAt: stats?.lastActiveAt?.toISOString() ?? null,
     }
   })
@@ -175,18 +299,6 @@ async function deliverInvite(params: {
   }
 }
 
-async function assertEmailFree(email: string) {
-  const [existing] = await db
-    .select({ id: userTable.id })
-    .from(userTable)
-    .where(eq(userTable.email, email))
-    .limit(1)
-
-  if (existing) {
-    throw new ConflictError("Someone with that email already has an account")
-  }
-}
-
 /* -------------------------------------------------------------------------- */
 /* Tenants                                                                     */
 /* -------------------------------------------------------------------------- */
@@ -208,7 +320,7 @@ adminRouter.post(
     body: z
       .object({
         name: nameSchema,
-        slug: slugSchema,
+        slug: tenantSlugSchema,
         ownerName: nameSchema,
         ownerEmail: emailSchema,
       })
@@ -223,49 +335,25 @@ adminRouter.post(
       ownerEmail: string
     }
 
-    const [taken] = await db
-      .select({ id: tenants.id })
-      .from(tenants)
-      .where(eq(tenants.slug, body.slug))
-      .limit(1)
-
-    if (taken) {
+    if (await tenantSlugTaken(body.slug)) {
       throw new ConflictError("An account with that slug already exists")
     }
 
     // Checked up front so a taken email does not leave an ownerless tenant.
     await assertEmailFree(body.ownerEmail)
 
-    const tenantId = newId()
-
-    const tenant = await db.transaction(async (tx) => {
-      const [created] = await tx
-        .insert(tenants)
-        .values({
-          id: tenantId,
-          name: body.name,
-          slug: body.slug,
-          createdByUserId: actor.user.id,
-        })
-        .returning()
-
-      await tx.insert(appSettings).values({ tenantId, brandName: body.name })
-
-      await tx.insert(apps).values({
-        id: newId(),
-        tenantId,
-        name: body.name,
-        slug: body.slug,
-        createdByUserId: actor.user.id,
-      })
-
-      return created!
+    const tenant = await createTenantWithFirstApp({
+      name: body.name,
+      slug: body.slug,
+      createdByUserId: actor.user.id,
+      signupSource: "admin",
     })
+    const tenantId = tenant.id
 
-    let owner: Awaited<ReturnType<typeof createPanelUser>>
+    let owner: Awaited<ReturnType<typeof invitePanelUser>>
 
     try {
-      owner = await createPanelUser({
+      owner = await invitePanelUser({
         tenantId,
         email: body.ownerEmail,
         name: body.ownerName,
@@ -359,9 +447,9 @@ adminRouter.patch(
 )
 
 /**
- * Places the account on a tier by hand. Until Stripe is connected this is the
- * only way a tier changes; afterwards Stripe's subscription state drives it
- * and this stays as the override for Scale contracts and goodwill.
+ * Places the account on a tier by hand: Scale contracts, goodwill, accounts
+ * that pay outside Stripe. Refused while a Stripe subscription is live, since
+ * the customer pays for that tier and the webhook would undo the change.
  */
 adminRouter.patch(
   "/tenants/:id/plan",
@@ -374,9 +462,16 @@ adminRouter.patch(
     const tenant = await loadTenant(req.params.id as string)
     const { plan } = req.body as { plan: PlanTier }
 
+    if (hasLiveSubscription(tenant)) {
+      throw new ConflictError(
+        "This account pays through Stripe. Its owner changes the plan from Billing."
+      )
+    }
+
     const [row] = await db
       .update(tenants)
-      .set({ plan, updatedAt: new Date() })
+      // A tier placed by hand settles any checkout left over from sign up.
+      .set({ plan, pendingPlan: null, pendingInterval: null, updatedAt: new Date() })
       .where(eq(tenants.id, tenant.id))
       .returning()
 
@@ -555,7 +650,28 @@ adminRouter.post(
       )
     }
 
-    const created = await createPanelUser({
+    // Nor once anyone has used the account. Data only arrives after someone
+    // signs in (API keys and integrations are created from the panel), so
+    // until then a login staff hand out can see nothing; afterwards it could.
+    // An account in use recovers through the password reset email instead.
+    const [used] = await db
+      .select({ id: userTable.id })
+      .from(userTable)
+      .where(
+        and(
+          eq(userTable.tenantId, tenant.id),
+          isNotNull(userTable.lastLoginAt)
+        )
+      )
+      .limit(1)
+
+    if (used) {
+      throw new ForbiddenError(
+        "Someone has already signed in to this account, so staff cannot add logins to it. Its team can recover access with the password reset email."
+      )
+    }
+
+    const created = await invitePanelUser({
       tenantId: tenant.id,
       email: body.email,
       name: body.name,
@@ -692,7 +808,7 @@ adminRouter.post(
     const actor = getAuth(req)
     const body = req.body as { name: string; email: string }
 
-    const created = await createPanelUser({
+    const created = await invitePanelUser({
       tenantId: null,
       email: body.email,
       name: body.name,

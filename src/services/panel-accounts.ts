@@ -28,6 +28,12 @@ export async function createPanelUser(params: {
   role: AccountRole
   permissions?: string[]
   invitedByUserId?: string | null
+  /**
+   * A password the person chose themselves, at sign up. They then neither
+   * get a temporary one nor have to change it, but must verify their email
+   * before they can sign in. Invites are verified by the act of using them.
+   */
+  password?: string
 }) {
   const email = params.email.trim().toLowerCase()
 
@@ -43,12 +49,13 @@ export async function createPanelUser(params: {
   }
 
   const context = await auth.$context
-  const temporaryPassword = generateTemporaryPassword()
+  const selfChosen = params.password !== undefined
+  const temporaryPassword = selfChosen ? null : generateTemporaryPassword()
 
   const created = await context.internalAdapter.createUser({
     name: params.name,
     email,
-    emailVerified: true,
+    emailVerified: !selfChosen,
     tenantId: params.tenantId,
     role: params.role,
   })
@@ -57,7 +64,7 @@ export async function createPanelUser(params: {
     userId: created.id,
     accountId: created.id,
     providerId: "credential",
-    password: await context.password.hash(temporaryPassword),
+    password: await context.password.hash(params.password ?? temporaryPassword!),
   })
 
   const [row] = await db
@@ -67,9 +74,9 @@ export async function createPanelUser(params: {
       // Owners and admins hold every permission implicitly, so only the
       // member grant list is worth persisting.
       permissions: params.role === "member" ? (params.permissions ?? []) : [],
-      mustChangePassword: true,
+      mustChangePassword: !selfChosen,
       invitedByUserId: params.invitedByUserId ?? null,
-      invitedAt: new Date(),
+      invitedAt: selfChosen ? null : new Date(),
       updatedAt: new Date(),
     })
     .where(eq(userTable.id, created.id))
@@ -80,6 +87,14 @@ export async function createPanelUser(params: {
   }
 
   return { user: row, temporaryPassword }
+}
+
+/** createPanelUser for an invite, where a temporary password always exists. */
+export async function invitePanelUser(
+  params: Omit<Parameters<typeof createPanelUser>[0], "password">
+) {
+  const created = await createPanelUser(params)
+  return { user: created.user, temporaryPassword: created.temporaryPassword! }
 }
 
 /**
