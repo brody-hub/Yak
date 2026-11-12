@@ -1,10 +1,11 @@
-import { isNull } from "drizzle-orm"
+import { and, eq, isNotNull, isNull } from "drizzle-orm"
 import { Router } from "express"
 import { z } from "zod"
 
 import { canManageUsers } from "../auth/permissions.js"
 import { db } from "../db/index.js"
-import { sideshiftCampaigns } from "../db/schema.js"
+import { sideshiftCampaigns, sideshiftConnection } from "../db/schema.js"
+import { withLookupScope, withTenantScope } from "../db/scope.js"
 import { env } from "../env.js"
 import {
   decryptSecret,
@@ -20,7 +21,7 @@ import {
   ValidationError,
 } from "../lib/errors.js"
 import { logger } from "../logger.js"
-import { getAuth } from "../middleware/auth.js"
+import { getAuth, getTenantId } from "../middleware/auth.js"
 import { requireApiKeyManagement } from "../middleware/permissions.js"
 import { validate, validatedQuery } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
@@ -33,14 +34,19 @@ import {
   type AnalyticsRange,
   type PostSort,
 } from "../services/sideshift/analytics.js"
-import { SIDESHIFT_ISSUER, SideshiftError } from "../services/sideshift/client.js"
+import {
+  SIDESHIFT_ISSUER,
+  SideshiftError,
+} from "../services/sideshift/client.js"
 import {
   clientCredentials,
   ensureConnection,
+  findConnectionByStateHash,
   loadConnection,
   saveTokens,
   updateConnection,
   withSideshiftLock,
+  sideshiftBinding,
 } from "../services/sideshift/connection.js"
 import {
   callbackUrl,
@@ -56,6 +62,7 @@ import {
   trackCampaigns,
   untrackCampaigns,
 } from "../services/sideshift/sync.js"
+import { loadTenant } from "../services/tenants.js"
 
 /**
  * Sideshift campaign analytics for the Marketing tab.
@@ -88,20 +95,26 @@ const DISCONNECTED_VALUES = {
   lastError: null,
   lastErrorAt: null,
   lastErrorRequestId: null,
+  oauthStateHash: null,
+  oauthVerifierEncrypted: null,
+  oauthStartedAt: null,
+  oauthStartedByUserId: null,
+  oauthCodeEncrypted: null,
 }
 
-function startSyncIfDue(status: string) {
+function startSyncIfDue(tenantId: string, status: string) {
   if (status === "connected") {
-    startSync("auto")
+    startSync(tenantId, "auto")
   }
 }
 
 sideshiftRouter.get("/status", async (req, res) => {
-  const data = await sideshiftStatus({
+  const tenantId = getTenantId(req)
+  const data = await sideshiftStatus(tenantId, {
     privileged: canManageUsers(getAuth(req).user),
   })
 
-  startSyncIfDue(data.status)
+  startSyncIfDue(tenantId, data.status)
   res.json({ data })
 })
 
@@ -120,16 +133,18 @@ sideshiftRouter.get(
       range: AnalyticsRange
       sort: PostSort
     }>(req)
-    const row = await loadConnection()
+    const tenantId = getTenantId(req)
+    const row = await loadConnection(tenantId)
 
     if (!row || row.status === "disconnected") {
       throw new NotFoundError("Sideshift connection")
     }
 
-    startSyncIfDue(row.status)
+    startSyncIfDue(tenantId, row.status)
 
     res.json({
       data: await campaignAnalytics({
+        tenantId,
         campaign: query.campaign,
         range: query.range,
         postSort: query.sort,
@@ -179,21 +194,23 @@ sideshiftRouter.get(
       days: number
       creators: string[]
     }>(req)
-    const row = await loadConnection()
+    const tenantId = getTenantId(req)
+    const row = await loadConnection(tenantId)
 
     if (!row || row.status === "disconnected") {
       throw new NotFoundError("Sideshift connection")
     }
 
-    startSyncIfDue(row.status)
+    startSyncIfDue(tenantId, row.status)
 
-    res.json({ data: await campaignSeries(query) })
+    res.json({ data: await campaignSeries({ tenantId, ...query }) })
   }
 )
 
 /** The Refresh button. Answers at once; the page polls status for the result. */
-sideshiftRouter.post("/refresh", async (_req, res) => {
-  const row = await loadConnection()
+sideshiftRouter.post("/refresh", async (req, res) => {
+  const tenantId = getTenantId(req)
+  const row = await loadConnection(tenantId)
 
   if (!row || row.status === "disconnected") {
     throw new NotFoundError("Sideshift connection")
@@ -207,7 +224,7 @@ sideshiftRouter.post("/refresh", async (_req, res) => {
     throw new RateLimitError("Synced moments ago. Try again in a minute.")
   }
 
-  startSync("manual")
+  startSync(tenantId, "manual")
   res.status(202).json({ data: { started: true } })
 })
 
@@ -222,12 +239,20 @@ sideshiftRouter.put(
   }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
     const wanted = new Set((req.body as { tracked: string[] }).tracked)
 
+    // Only this tenant's campaigns are known, so an id from another tenant is
+    // rejected as unknown below.
     const campaigns = await db
       .select()
       .from(sideshiftCampaigns)
-      .where(isNull(sideshiftCampaigns.removedAt))
+      .where(
+        and(
+          eq(sideshiftCampaigns.tenantId, tenantId),
+          isNull(sideshiftCampaigns.removedAt)
+        )
+      )
     const known = new Set(campaigns.map((campaign) => campaign.id))
     const unknown = [...wanted].filter((id) => !known.has(id))
 
@@ -245,15 +270,16 @@ sideshiftRouter.put(
       .filter((campaign) => !wanted.has(campaign.id) && campaign.tracked)
       .map((campaign) => campaign.id)
 
-    await untrackCampaigns(toUntrack)
-    await trackCampaigns(toTrack)
+    await untrackCampaigns(tenantId, toUntrack)
+    await trackCampaigns(tenantId, toTrack)
 
     if (toTrack.length > 0) {
-      startSync("immediate")
+      startSync(tenantId, "immediate")
     }
 
     if (toTrack.length > 0 || toUntrack.length > 0) {
       await recordActivity({
+        tenantId,
         userId: user.id,
         action: "updated",
         section: "integrations",
@@ -262,29 +288,37 @@ sideshiftRouter.put(
       })
     }
 
-    res.json({ data: await sideshiftStatus({ privileged: true }) })
+    res.json({ data: await sideshiftStatus(tenantId, { privileged: true }) })
   }
 )
 
 /**
- * Starts the OAuth flow. Registers this deployment with Sideshift the first
- * time, or again when the API's public URL changed, then hands the panel the
- * consent URL to navigate to.
+ * Starts the OAuth flow. Registers the tenant's connection with Sideshift the
+ * first time, or again when the API's public URL changed, then hands the panel
+ * the consent URL to navigate to.
  */
 sideshiftRouter.post("/connect", requireApiKeyManagement, async (req, res) => {
   const { user } = getAuth(req)
+  const tenantId = getTenantId(req)
   const redirectUri = callbackUrl()
-  let row = await ensureConnection()
+  let row = await ensureConnection(tenantId)
 
   if (!row.clientId || row.redirectUri !== redirectUri) {
     try {
-      const client = await registerClient(redirectUri)
+      const tenant = await loadTenant(tenantId)
+      const client = await registerClient(redirectUri, tenant.name)
 
-      await updateConnection({
+      await updateConnection(tenantId, {
         clientId: client.clientId,
-        clientSecretEncrypted: encryptSecret(client.clientSecret),
+        clientSecretEncrypted: encryptSecret(
+          client.clientSecret,
+          sideshiftBinding(tenantId)
+        ),
         registrationAccessTokenEncrypted: client.registrationAccessToken
-          ? encryptSecret(client.registrationAccessToken)
+          ? encryptSecret(
+              client.registrationAccessToken,
+              sideshiftBinding(tenantId)
+            )
           : null,
         redirectUri,
       })
@@ -293,7 +327,9 @@ sideshiftRouter.post("/connect", requireApiKeyManagement, async (req, res) => {
         {
           err: error instanceof SideshiftError ? undefined : error,
           code: error instanceof SideshiftError ? error.code : undefined,
-          requestId: error instanceof SideshiftError ? error.requestId : undefined,
+          requestId:
+            error instanceof SideshiftError ? error.requestId : undefined,
+          tenantId,
         },
         "Sideshift client registration failed"
       )
@@ -302,7 +338,7 @@ sideshiftRouter.post("/connect", requireApiKeyManagement, async (req, res) => {
       )
     }
 
-    row = (await loadConnection())!
+    row = (await loadConnection(tenantId))!
   }
 
   const authorization = createAuthorization({
@@ -310,11 +346,16 @@ sideshiftRouter.post("/connect", requireApiKeyManagement, async (req, res) => {
     redirectUri,
   })
 
-  await updateConnection({
+  await updateConnection(tenantId, {
     oauthStateHash: sha256(authorization.state),
-    oauthVerifierEncrypted: encryptSecret(authorization.verifier),
+    oauthVerifierEncrypted: encryptSecret(
+      authorization.verifier,
+      sideshiftBinding(tenantId)
+    ),
     oauthStartedAt: new Date(),
     oauthStartedByUserId: user.id,
+    // A new Connect click supersedes any code still waiting from an old one.
+    oauthCodeEncrypted: null,
   })
 
   res.json({ data: { authorizeUrl: authorization.url } })
@@ -329,26 +370,34 @@ sideshiftRouter.delete(
   requireApiKeyManagement,
   async (req, res) => {
     const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
 
     const outcome = await withSideshiftLock(
+      tenantId,
       async () => {
-        const row = await loadConnection()
+        const row = await loadConnection(tenantId)
 
         if (row?.refreshTokenEncrypted && row.clientId) {
           try {
             await revokeRefreshToken(
               clientCredentials(row),
-              decryptSecret(row.refreshTokenEncrypted)
+              decryptSecret(
+                row.refreshTokenEncrypted,
+                sideshiftBinding(tenantId)
+              )
             )
           } catch (error) {
             // Still disconnect locally. The token is forgotten either way and
             // the founder can remove Yak from Sideshift's own settings.
-            logger.warn({ err: error }, "Could not revoke the Sideshift token")
+            logger.warn(
+              { err: error, tenantId },
+              "Could not revoke the Sideshift token"
+            )
           }
         }
 
-        await updateConnection(DISCONNECTED_VALUES)
-        await clearSideshiftCache()
+        await updateConnection(tenantId, DISCONNECTED_VALUES)
+        await clearSideshiftCache(tenantId)
       },
       { waitMs: LOCK_WAIT_MS }
     )
@@ -358,6 +407,7 @@ sideshiftRouter.delete(
     }
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "deleted",
       section: "integrations",
@@ -365,19 +415,36 @@ sideshiftRouter.delete(
       ipAddress: req.ip,
     })
 
-    res.json({ data: await sideshiftStatus({ privileged: true }) })
+    res.json({ data: await sideshiftStatus(tenantId, { privileged: true }) })
   }
 )
 
 /* -------------------------------------------------------------------------- */
-/* OAuth callback                                                              */
+/* OAuth callback and confirmation                                             */
 /* -------------------------------------------------------------------------- */
+
+const PENDING_OAUTH_CLEARED = {
+  oauthStateHash: null,
+  oauthVerifierEncrypted: null,
+  oauthStartedAt: null,
+  oauthStartedByUserId: null,
+  oauthCodeEncrypted: null,
+}
 
 /**
  * Where Sideshift sends the browser after consent. Mounted outside the session
- * guard because the panel and API live on different hosts: the request is
- * authenticated by the one-time `state` an owner or admin created by clicking
- * Connect, and it always ends by redirecting back to the Marketing tab.
+ * guard because the session cookie does not reliably reach this host on a
+ * top-level navigation (it is partitioned to the panel in production).
+ *
+ * It does not finish the connection. The code is only parked on the
+ * connection and the browser goes back to the panel, where the user who
+ * clicked Connect confirms with a click through POST /sideshift/complete from
+ * their own session. So a link opened by anyone else connects nothing to their
+ * account, and nobody can be made to connect an account by a link alone.
+ *
+ * What OAuth itself cannot stop: whoever clicked Connect can forward their
+ * consent link to a Sideshift user elsewhere. Sideshift's consent screen names
+ * the requesting workspace, which is the safeguard there.
  */
 export const sideshiftCallbackRouter: Router = Router()
 
@@ -389,42 +456,49 @@ sideshiftCallbackRouter.get("/sideshift/callback", async (req, res) => {
     return typeof value === "string" ? value : null
   }
 
+  // The state is the only thing tying this request to a tenant: the pending
+  // authorization that holds its hash says whose connection this is. The
+  // request has no session and so no database scope; the lookup scope is the
+  // one way to find the row before its tenant is known, and everything after
+  // runs in that tenant's scope.
   const state = param("state")
-  const row = await loadConnection()
+  const row = state
+    ? await withLookupScope(() => findConnectionByStateHash(sha256(state)))
+    : undefined
 
   if (
     !state ||
     !row?.oauthStateHash ||
     !row.oauthVerifierEncrypted ||
+    // A second visit with the same state is a replay.
+    row.oauthCodeEncrypted ||
     !safeEqual(sha256(state), row.oauthStateHash)
   ) {
     back("invalid_state")
     return
   }
 
-  const startedBy = row.oauthStartedByUserId
-  const verifier = decryptSecret(row.oauthVerifierEncrypted)
+  const tenantId = row.tenantId
   const expired =
     !row.oauthStartedAt ||
     Date.now() - row.oauthStartedAt.getTime() > AUTHORIZATION_TTL_MS
 
-  // Single use, whatever happens next.
-  await updateConnection({
-    oauthStateHash: null,
-    oauthVerifierEncrypted: null,
-    oauthStartedAt: null,
-    oauthStartedByUserId: null,
-  })
+  const fail = async (outcome: string) => {
+    await withTenantScope(tenantId, () =>
+      updateConnection(tenantId, PENDING_OAUTH_CLEARED)
+    )
+    back(outcome)
+  }
 
   if (expired) {
-    back("expired")
+    await fail("expired")
     return
   }
 
   const error = param("error")
 
   if (error) {
-    back(error === "access_denied" ? "denied" : "error")
+    await fail(error === "access_denied" ? "denied" : "error")
     return
   }
 
@@ -433,83 +507,192 @@ sideshiftCallbackRouter.get("/sideshift/callback", async (req, res) => {
   const code = param("code")
 
   if ((issuer && issuer !== SIDESHIFT_ISSUER) || !code) {
-    back("error")
+    await fail("error")
     return
   }
 
-  try {
-    const outcome = await withSideshiftLock(
-      async () => {
-        const current = (await loadConnection())!
-        const client = clientCredentials(current)
-        const tokens = await exchangeCode(client, {
-          code,
-          verifier,
-          redirectUri: current.redirectUri ?? callbackUrl(),
-        })
+  // Compare-and-set, so two racing callbacks with the same state cannot both
+  // park a code.
+  const parked = await withTenantScope(tenantId, (scoped) =>
+    scoped
+      .update(sideshiftConnection)
+      .set({
+        oauthCodeEncrypted: encryptSecret(code, sideshiftBinding(tenantId)),
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(sideshiftConnection.tenantId, tenantId),
+          eq(sideshiftConnection.oauthStateHash, sha256(state)),
+          isNull(sideshiftConnection.oauthCodeEncrypted)
+        )
+      )
+      .returning({ tenantId: sideshiftConnection.tenantId })
+  )
 
-        // Reconnecting replaces an older grant. Retire it so it cannot linger.
-        if (current.refreshTokenEncrypted) {
-          await revokeRefreshToken(
-            client,
-            decryptSecret(current.refreshTokenEncrypted)
-          ).catch((revokeError: unknown) => {
-            logger.warn({ err: revokeError }, "Could not revoke the old Sideshift token")
-          })
-        }
+  if (parked.length === 0) {
+    back("invalid_state")
+    return
+  }
 
-        const switchedCompany =
-          Boolean(current.companyId && tokens.company.id) &&
-          current.companyId !== tokens.company.id
+  res.redirect(
+    303,
+    `${env.APP_URL}/marketing?sideshift=confirm&sideshift_state=${encodeURIComponent(state)}`
+  )
+})
 
-        if (switchedCompany) {
-          await clearSideshiftCache()
-        }
+/**
+ * Finishes a connection the callback parked. Only the user who clicked Connect,
+ * signed in to the same tenant, can do this.
+ *
+ * Always answers 200 with an `outcome` the Marketing tab already knows how to
+ * show, except when the request is not valid at all.
+ */
+sideshiftRouter.post(
+  "/complete",
+  requireApiKeyManagement,
+  validate({
+    body: z.object({ state: z.string().min(1).max(512) }).strict(),
+  }),
+  async (req, res) => {
+    const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
+    const { state } = req.body as { state: string }
 
-        await saveTokens(tokens)
-        await updateConnection({
-          status: "connected",
-          companyId: tokens.company.id,
-          companyName: tokens.company.name,
-          connectedAt: new Date(),
-          connectedByUserId: startedBy,
-          syncStartedAt: null,
-          lastError: null,
-          lastErrorAt: null,
-          lastErrorRequestId: null,
-        })
-      },
-      { waitMs: LOCK_WAIT_MS }
-    )
+    // Claim and clear the pending authorization in one statement: it only
+    // matches this tenant, this state, the user who clicked Connect, and a
+    // code the callback parked. Single use, and safe against a double submit.
+    const [row] = await db
+      .update(sideshiftConnection)
+      .set({ ...PENDING_OAUTH_CLEARED, updatedAt: new Date() })
+      .where(
+        and(
+          eq(sideshiftConnection.tenantId, tenantId),
+          eq(sideshiftConnection.oauthStateHash, sha256(state)),
+          eq(sideshiftConnection.oauthStartedByUserId, user.id),
+          isNotNull(sideshiftConnection.oauthCodeEncrypted),
+          isNotNull(sideshiftConnection.oauthVerifierEncrypted)
+        )
+      )
+      .returning({
+        verifier: sideshiftConnection.oauthVerifierEncrypted,
+        code: sideshiftConnection.oauthCodeEncrypted,
+        startedAt: sideshiftConnection.oauthStartedAt,
+      })
 
-    if (!outcome.acquired) {
-      back("busy")
+    if (!row?.verifier || !row.code) {
+      throw new ValidationError(
+        "This Sideshift connection request is not valid. Click Connect again."
+      )
+    }
+
+    const verifier = decryptSecret(row.verifier, sideshiftBinding(tenantId))
+    const code = decryptSecret(row.code, sideshiftBinding(tenantId))
+    const expired =
+      !row.startedAt ||
+      Date.now() - row.startedAt.getTime() > AUTHORIZATION_TTL_MS
+
+    if (expired) {
+      res.json({ data: { outcome: "expired" } })
       return
     }
-  } catch (exchangeError) {
-    logger.error(
-      {
-        err: exchangeError instanceof SideshiftError ? undefined : exchangeError,
-        code: exchangeError instanceof SideshiftError ? exchangeError.code : undefined,
-        requestId:
-          exchangeError instanceof SideshiftError ? exchangeError.requestId : undefined,
-      },
-      "Sideshift token exchange failed"
-    )
-    back("error")
-    return
-  }
 
-  if (startedBy) {
+    // A suspended account never reaches here (requireTenantUser), but this
+    // also covers a suspension that landed mid-flow.
+    const tenant = await loadTenant(tenantId)
+
+    if (tenant.status !== "active") {
+      res.json({ data: { outcome: "error" } })
+      return
+    }
+
+    try {
+      const outcome = await withSideshiftLock(
+        tenantId,
+        async () => {
+          const current = (await loadConnection(tenantId))!
+          const client = clientCredentials(current)
+          const tokens = await exchangeCode(client, {
+            code,
+            verifier,
+            redirectUri: current.redirectUri ?? callbackUrl(),
+          })
+
+          // Reconnecting replaces an older grant. Retire it so it cannot linger.
+          if (current.refreshTokenEncrypted) {
+            await revokeRefreshToken(
+              client,
+              decryptSecret(
+                current.refreshTokenEncrypted,
+                sideshiftBinding(tenantId)
+              )
+            ).catch((revokeError: unknown) => {
+              logger.warn(
+                { err: revokeError, tenantId },
+                "Could not revoke the old Sideshift token"
+              )
+            })
+          }
+
+          const switchedCompany =
+            Boolean(current.companyId && tokens.company.id) &&
+            current.companyId !== tokens.company.id
+
+          if (switchedCompany) {
+            await clearSideshiftCache(tenantId)
+          }
+
+          await saveTokens(tenantId, tokens)
+          await updateConnection(tenantId, {
+            status: "connected",
+            companyId: tokens.company.id,
+            companyName: tokens.company.name,
+            connectedAt: new Date(),
+            connectedByUserId: user.id,
+            syncStartedAt: null,
+            lastError: null,
+            lastErrorAt: null,
+            lastErrorRequestId: null,
+          })
+        },
+        { waitMs: LOCK_WAIT_MS }
+      )
+
+      if (!outcome.acquired) {
+        res.json({ data: { outcome: "busy" } })
+        return
+      }
+    } catch (exchangeError) {
+      logger.error(
+        {
+          err:
+            exchangeError instanceof SideshiftError ? undefined : exchangeError,
+          code:
+            exchangeError instanceof SideshiftError
+              ? exchangeError.code
+              : undefined,
+          requestId:
+            exchangeError instanceof SideshiftError
+              ? exchangeError.requestId
+              : undefined,
+          tenantId,
+        },
+        "Sideshift token exchange failed"
+      )
+      res.json({ data: { outcome: "error" } })
+      return
+    }
+
     await recordActivity({
-      userId: startedBy,
+      tenantId,
+      userId: user.id,
       action: "updated",
       section: "integrations",
       summary: "Connected Sideshift",
       ipAddress: req.ip,
     })
-  }
 
-  startSync("immediate")
-  back("connected")
-})
+    startSync(tenantId, "immediate")
+    res.json({ data: { outcome: "connected" } })
+  }
+)

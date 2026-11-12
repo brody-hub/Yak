@@ -3,20 +3,17 @@ import { Router } from "express"
 import { z } from "zod"
 
 import { db } from "../../db/index.js"
-import {
-  analyticsEvents,
-  appUsers,
-  reports,
-  tickets,
-} from "../../db/schema.js"
+import { analyticsEvents, appUsers, reports, tickets } from "../../db/schema.js"
 import { newId } from "../../lib/crypto.js"
 import { NotFoundError } from "../../lib/errors.js"
 import { serializeAppUser } from "../../lib/serializers.js"
 import { logger } from "../../logger.js"
 import { getApiKey, requireApiKey } from "../../middleware/api-key.js"
+import { getScope } from "../../middleware/auth.js"
 import { ingestLimiter } from "../../middleware/rate-limit.js"
 import { validate } from "../../middleware/validate.js"
 import { fireDiscordTrigger } from "../../services/discord.js"
+import { loadApp } from "../../services/tenants.js"
 
 export const publicUsersRouter: Router = Router()
 
@@ -37,11 +34,11 @@ const blankToNull = (value: unknown) =>
 const MAX_CLOCK_SKEW_MS = 24 * 60 * 60 * 1000
 
 /**
- * Upserts an end user.
+ * Upserts an end user of the key's app.
  *
- * Idempotent on `externalId` so the integrating app can call this on every
- * sign-in without creating duplicates. The body replaces the stored record, so
- * a field left out goes back to its default.
+ * Idempotent on `externalId` within the app so the integrating app can call
+ * this on every sign-in without creating duplicates. The body replaces the
+ * stored record, so a field left out goes back to its default.
  *
  * Fires the `new_user` Discord trigger only on genuine first insert, and not
  * at all when the app passes `notify: false` (an existing account being synced
@@ -95,11 +92,18 @@ publicUsersRouter.put(
       notify: boolean
       metadata?: Record<string, unknown>
     }
+    const { tenantId, appId } = getScope(req)
 
     const [existing] = await db
       .select({ id: appUsers.id, plan: appUsers.plan, status: appUsers.status })
       .from(appUsers)
-      .where(eq(appUsers.externalId, body.externalId))
+      .where(
+        and(
+          eq(appUsers.tenantId, tenantId),
+          eq(appUsers.appId, appId),
+          eq(appUsers.externalId, body.externalId)
+        )
+      )
       .limit(1)
 
     const values = {
@@ -118,40 +122,60 @@ publicUsersRouter.put(
 
     const [row] = await db
       .insert(appUsers)
-      .values({ id: newId(), externalId: body.externalId, ...values })
-      .onConflictDoUpdate({ target: appUsers.externalId, set: values })
+      .values({
+        id: newId(),
+        tenantId,
+        appId,
+        externalId: body.externalId,
+        ...values,
+      })
+      .onConflictDoUpdate({
+        target: [appUsers.tenantId, appUsers.appId, appUsers.externalId],
+        set: values,
+      })
       .returning()
 
     if (!row) {
       throw new NotFoundError("User")
     }
 
-    if (!existing && body.notify) {
-      void fireDiscordTrigger("new_user", {
-        title: "New user",
-        description: `${row.name} joined`,
-        fields: [
-          { name: "Email", value: row.email ?? "Not provided", inline: true },
-          { name: "Platform", value: row.platform ?? "Unknown", inline: true },
-          { name: "Plan", value: row.plan, inline: true },
-        ],
-      })
-    }
-
     // A paid plan the user did not previously hold is a new subscription.
     const startedSubscription =
       body.plan !== "free" && (!existing || existing.plan === "free")
 
-    if (startedSubscription && body.notify) {
-      void fireDiscordTrigger("new_subscription", {
-        title: "New subscription",
-        description: `${row.name} started ${row.plan}`,
-        fields: [
-          { name: "Plan", value: row.plan, inline: true },
-          { name: "Billing", value: row.billingPeriod, inline: true },
-          { name: "Status", value: row.status, inline: true },
-        ],
-      })
+    if (body.notify && (!existing || startedSubscription)) {
+      const app = await loadApp(tenantId, appId)
+      const origin = { id: app.id, name: app.name }
+
+      if (!existing) {
+        void fireDiscordTrigger(tenantId, "new_user", {
+          title: "New user",
+          description: `${row.name} joined`,
+          fields: [
+            { name: "Email", value: row.email ?? "Not provided", inline: true },
+            {
+              name: "Platform",
+              value: row.platform ?? "Unknown",
+              inline: true,
+            },
+            { name: "Plan", value: row.plan, inline: true },
+          ],
+          app: origin,
+        })
+      }
+
+      if (startedSubscription) {
+        void fireDiscordTrigger(tenantId, "new_subscription", {
+          title: "New subscription",
+          description: `${row.name} started ${row.plan}`,
+          fields: [
+            { name: "Plan", value: row.plan, inline: true },
+            { name: "Billing", value: row.billingPeriod, inline: true },
+            { name: "Status", value: row.status, inline: true },
+          ],
+          app: origin,
+        })
+      }
     }
 
     res.status(existing ? 200 : 201).json({ data: serializeAppUser(row) })
@@ -164,10 +188,18 @@ publicUsersRouter.get(
   ingestLimiter,
   validate({ params: z.object({ externalId: z.string().min(1).max(120) }) }),
   async (req, res) => {
+    const { tenantId, appId } = getScope(req)
+
     const [row] = await db
       .select()
       .from(appUsers)
-      .where(eq(appUsers.externalId, req.params.externalId as string))
+      .where(
+        and(
+          eq(appUsers.tenantId, tenantId),
+          eq(appUsers.appId, appId),
+          eq(appUsers.externalId, req.params.externalId as string)
+        )
+      )
       .limit(1)
 
     if (!row) {
@@ -179,12 +211,13 @@ publicUsersRouter.get(
 )
 
 /**
- * Erases an end user, for when they delete their account in the app.
+ * Erases an end user of the key's app, for when they delete their account.
  *
- * Removes everything held about the person: the user record, their analytics
- * events, and their support reports with the whole conversation. Succeeds even
- * when no user record exists, because events and reports can be sent for
- * someone who was never synced, and so a retried delete is harmless.
+ * Removes everything held about the person in this app: the user record,
+ * their analytics events, and their support reports with the whole
+ * conversation. Succeeds even when no user record exists, because events and
+ * reports can be sent for someone who was never synced, and so a retried
+ * delete is harmless.
  */
 publicUsersRouter.delete(
   "/:externalId",
@@ -195,31 +228,48 @@ publicUsersRouter.delete(
   }),
   async (req, res) => {
     const apiKey = getApiKey(req)
+    const { tenantId, appId } = getScope(req)
     const externalId = req.params.externalId as string
 
     const deleted = await db.transaction(async (tx) => {
       const [user] = await tx
         .delete(appUsers)
-        .where(eq(appUsers.externalId, externalId))
+        .where(
+          and(
+            eq(appUsers.tenantId, tenantId),
+            eq(appUsers.appId, appId),
+            eq(appUsers.externalId, externalId)
+          )
+        )
         .returning({ email: appUsers.email })
 
       const events = await tx
         .delete(analyticsEvents)
-        .where(eq(analyticsEvents.externalUserId, externalId))
+        .where(
+          and(
+            eq(analyticsEvents.tenantId, tenantId),
+            eq(analyticsEvents.appId, appId),
+            eq(analyticsEvents.externalUserId, externalId)
+          )
+        )
 
       // Reports filed without a user id are matched on the address instead.
       // Ones carrying a different id belong to someone else sharing it.
       const removedReports = await tx
         .delete(reports)
         .where(
-          or(
-            eq(reports.externalUserId, externalId),
-            user?.email
-              ? and(
-                  isNull(reports.externalUserId),
-                  eq(reports.reporterEmail, user.email)
-                )
-              : undefined
+          and(
+            eq(reports.tenantId, tenantId),
+            eq(reports.appId, appId),
+            or(
+              eq(reports.externalUserId, externalId),
+              user?.email
+                ? and(
+                    isNull(reports.externalUserId),
+                    eq(reports.reporterEmail, user.email)
+                  )
+                : undefined
+            )
           )
         )
         .returning({ id: reports.id })
@@ -230,9 +280,12 @@ publicUsersRouter.delete(
           .update(tickets)
           .set({ sourceReportId: null })
           .where(
-            inArray(
-              tickets.sourceReportId,
-              removedReports.map((report) => report.id)
+            and(
+              eq(tickets.tenantId, tenantId),
+              inArray(
+                tickets.sourceReportId,
+                removedReports.map((report) => report.id)
+              )
             )
           )
       }

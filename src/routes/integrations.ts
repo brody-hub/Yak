@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 import { Router } from "express"
 import { z } from "zod"
 
@@ -7,7 +7,7 @@ import { db } from "../db/index.js"
 import { providerIntegrations } from "../db/schema.js"
 import { decryptSecret, encryptSecret } from "../lib/crypto.js"
 import { NotFoundError } from "../lib/errors.js"
-import { getAuth } from "../middleware/auth.js"
+import { getAuth, getScope, getTenantId } from "../middleware/auth.js"
 import { requireApiKeyManagement } from "../middleware/permissions.js"
 import { validate } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
@@ -17,9 +17,16 @@ import {
   clearRevenueCatCache,
   fetchOverview,
   resolveProject,
+  revenueCatBinding,
 } from "../services/revenuecat.js"
 
-export const integrationsRouter: Router = Router()
+/**
+ * Mounted under /apps/:appId. RevenueCat is connected per app; Sideshift is an
+ * account-level connection that is listed here so widgets can see it.
+ */
+export const integrationsRouter: Router = Router({ mergeParams: true })
+
+type Scope = { tenantId: string; appId: string }
 
 /* -------------------------------------------------------------------------- */
 /* Provider catalogue                                                          */
@@ -78,8 +85,18 @@ function buildStatus(
 integrationsRouter.get("/", async (req, res) => {
   const auth = getAuth(req)
   const privileged = canManageUsers(auth.user)
+  const tenantId = getTenantId(req)
+  const scope = getScope(req)
 
-  const rows = await db.select().from(providerIntegrations)
+  const rows = await db
+    .select()
+    .from(providerIntegrations)
+    .where(
+      and(
+        eq(providerIntegrations.tenantId, scope.tenantId),
+        eq(providerIntegrations.appId, scope.appId)
+      )
+    )
   const byProvider = new Map(rows.map((row) => [row.provider, row]))
 
   res.json({
@@ -87,7 +104,7 @@ integrationsRouter.get("/", async (req, res) => {
       ...PROVIDERS.map((provider) =>
         buildStatus(provider, byProvider.get(provider.id), privileged)
       ),
-      await sideshiftIntegrationStatus(privileged),
+      await sideshiftIntegrationStatus(tenantId, privileged),
     ],
   })
 })
@@ -99,9 +116,10 @@ integrationsRouter.get("/", async (req, res) => {
  * its cached data is still there to show.
  */
 async function sideshiftIntegrationStatus(
+  tenantId: string,
   privileged: boolean
 ): Promise<IntegrationStatus> {
-  const row = await loadSideshiftConnection()
+  const row = await loadSideshiftConnection(tenantId)
   const connected = Boolean(row && row.status !== "disconnected")
 
   return {
@@ -122,18 +140,28 @@ async function sideshiftIntegrationStatus(
 /* RevenueCat                                                                  */
 /* -------------------------------------------------------------------------- */
 
-async function loadRevenueCatRow(): Promise<IntegrationRow | undefined> {
+function revenueCatRow(scope: Scope) {
+  return and(
+    eq(providerIntegrations.tenantId, scope.tenantId),
+    eq(providerIntegrations.appId, scope.appId),
+    eq(providerIntegrations.provider, "revenuecat")
+  )
+}
+
+async function loadRevenueCatRow(
+  scope: Scope
+): Promise<IntegrationRow | undefined> {
   const [row] = await db
     .select()
     .from(providerIntegrations)
-    .where(eq(providerIntegrations.provider, "revenuecat"))
+    .where(revenueCatRow(scope))
     .limit(1)
 
   return row
 }
 
-async function revenueCatStatus(): Promise<IntegrationStatus> {
-  return buildStatus(PROVIDERS[0]!, await loadRevenueCatRow(), true)
+async function revenueCatStatus(scope: Scope): Promise<IntegrationStatus> {
+  return buildStatus(PROVIDERS[0]!, await loadRevenueCatRow(scope), true)
 }
 
 /**
@@ -158,13 +186,20 @@ integrationsRouter.put(
   }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const scope = getScope(req)
+    const { tenantId, appId } = scope
     const body = req.body as { apiKey: string; projectId?: string }
 
     const project = await resolveProject(body.apiKey, body.projectId)
 
     const values = {
+      tenantId,
+      appId,
       provider: "revenuecat" as const,
-      apiKeyEncrypted: encryptSecret(body.apiKey),
+      apiKeyEncrypted: encryptSecret(
+        body.apiKey,
+        revenueCatBinding(tenantId, appId)
+      ),
       apiKeyHint: apiKeyHint(body.apiKey),
       externalId: project.id,
       externalName: project.name,
@@ -179,21 +214,27 @@ integrationsRouter.put(
       .insert(providerIntegrations)
       .values(values)
       .onConflictDoUpdate({
-        target: providerIntegrations.provider,
+        target: [
+          providerIntegrations.tenantId,
+          providerIntegrations.appId,
+          providerIntegrations.provider,
+        ],
         set: values,
       })
 
-    clearRevenueCatCache()
+    clearRevenueCatCache(tenantId, appId)
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "updated",
       section: "integrations",
-      summary: `Connected RevenueCat project ${project.name}`,
+      summary: `Connected RevenueCat project ${project.name} to ${req.currentApp!.name}`,
+      metadata: { appId },
       ipAddress: req.ip,
     })
 
-    res.json({ data: await revenueCatStatus() })
+    res.json({ data: await revenueCatStatus(scope) })
   }
 )
 
@@ -203,24 +244,31 @@ integrationsRouter.post(
   requireApiKeyManagement,
   async (req, res) => {
     const { user } = getAuth(req)
-    const row = await loadRevenueCatRow()
+    const scope = getScope(req)
+    const { tenantId, appId } = scope
+    const row = await loadRevenueCatRow(scope)
 
     if (!row?.externalId) {
       throw new NotFoundError("RevenueCat connection")
     }
 
-    clearRevenueCatCache()
+    clearRevenueCatCache(tenantId, appId)
 
     try {
       const overview = await fetchOverview({
-        apiKey: decryptSecret(row.apiKeyEncrypted),
+        tenantId,
+        appId,
+        apiKey: decryptSecret(
+          row.apiKeyEncrypted,
+          revenueCatBinding(tenantId, appId)
+        ),
         projectId: row.externalId,
       })
 
       await db
         .update(providerIntegrations)
         .set({ lastCheckedAt: new Date(), lastError: null })
-        .where(eq(providerIntegrations.provider, "revenuecat"))
+        .where(revenueCatRow(scope))
 
       res.json({
         data: {
@@ -236,11 +284,12 @@ integrationsRouter.post(
       await db
         .update(providerIntegrations)
         .set({ lastCheckedAt: new Date(), lastError: message })
-        .where(eq(providerIntegrations.provider, "revenuecat"))
+        .where(revenueCatRow(scope))
 
       // Recorded against the connection so the settings page can explain the
       // failure the next time it loads, then rethrown for the caller.
       await recordActivity({
+        tenantId,
         userId: user.id,
         action: "updated",
         section: "integrations",
@@ -259,24 +308,28 @@ integrationsRouter.delete(
   requireApiKeyManagement,
   async (req, res) => {
     const { user } = getAuth(req)
+    const scope = getScope(req)
+    const { tenantId, appId } = scope
 
     const deleted = await db
       .delete(providerIntegrations)
-      .where(eq(providerIntegrations.provider, "revenuecat"))
+      .where(revenueCatRow(scope))
       .returning()
 
-    clearRevenueCatCache()
+    clearRevenueCatCache(tenantId, appId)
 
     if (deleted.length > 0) {
       await recordActivity({
+        tenantId,
         userId: user.id,
         action: "deleted",
         section: "integrations",
-        summary: "Removed the RevenueCat connection",
+        summary: `Removed the RevenueCat connection from ${req.currentApp!.name}`,
+        metadata: { appId },
         ipAddress: req.ip,
       })
     }
 
-    res.json({ data: await revenueCatStatus() })
+    res.json({ data: await revenueCatStatus(scope) })
   }
 )

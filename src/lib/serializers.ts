@@ -1,4 +1,10 @@
-import { effectivePermissions, isValidRole } from "../auth/permissions.js"
+import type { TenantContext } from "../auth/context.js"
+import {
+  type AccountRole,
+  effectivePermissions,
+  isSuperAdminRole,
+  isValidRole,
+} from "../auth/permissions.js"
 import type {
   ActivityLogEntry,
   AnalyticsEvent,
@@ -56,7 +62,11 @@ function avatarFor(
 /* -------------------------------------------------------------------------- */
 
 export function serializeSystemUser(row: User) {
-  const role = isValidRole(row.role) ? row.role : "member"
+  const role: AccountRole = isSuperAdminRole(row.role)
+    ? row.role
+    : isValidRole(row.role)
+      ? row.role
+      : "member"
 
   return {
     id: row.id,
@@ -80,11 +90,24 @@ export function serializeSystemUser(row: User) {
 
 export type SerializedSystemUser = ReturnType<typeof serializeSystemUser>
 
-/** The subset of the profile the signed-in user gets about themselves. */
-export function serializeCurrentUser(row: User) {
+/**
+ * The subset of the profile the signed-in user gets about themselves, plus the
+ * account they belong to so the panel knows which experience to show. Super
+ * admins get `tenant: null`.
+ */
+export function serializeCurrentUser(row: User, tenant: TenantContext | null) {
   return {
     ...serializeSystemUser(row),
     mustChangePassword: row.mustChangePassword,
+    isSuperAdmin: isSuperAdminRole(row.role),
+    tenant: tenant
+      ? {
+          id: tenant.id,
+          name: tenant.name,
+          slug: tenant.slug,
+          status: tenant.status,
+        }
+      : null,
   }
 }
 
@@ -171,6 +194,7 @@ export function serializeReportMessage(row: ReportMessage) {
 export function serializeReport(row: Report, messages: ReportMessage[] = []) {
   return {
     id: row.id,
+    appId: row.appId,
     number: row.number,
     type: row.type,
     status: row.status,
@@ -197,6 +221,7 @@ export function serializeReportForApi(
 ) {
   return {
     id: row.id,
+    appId: row.appId,
     number: row.number,
     token: row.publicToken,
     type: row.type,
@@ -234,6 +259,7 @@ export function serializeReportForApi(
 export function serializeAnalyticsEvent(row: AnalyticsEvent) {
   return {
     id: row.id,
+    appId: row.appId,
     name: row.name,
     userId: row.externalUserId ?? row.anonymousId ?? "anonymous",
     userName: row.userName ?? "Unknown user",
@@ -250,6 +276,7 @@ export function serializeAnalyticsEvent(row: AnalyticsEvent) {
 export function serializeAppUser(row: AppUser) {
   return {
     id: row.externalId,
+    appId: row.appId,
     name: row.name,
     email: row.email,
     avatar: row.avatarUrl ?? fallbackAvatarUrl(row.name),
@@ -284,6 +311,7 @@ export function serializeSettings(row: AppSettings) {
 export function serializeApiKey(row: ApiKey) {
   return {
     id: row.id,
+    appId: row.appId,
     name: row.name,
     prefix: row.prefix,
     scopes: row.scopes,

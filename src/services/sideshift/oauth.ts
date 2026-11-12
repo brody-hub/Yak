@@ -29,9 +29,14 @@ export type RegisteredClient = {
   registrationAccessToken: string | null
 }
 
-/** Registers this deployment with Sideshift (RFC 7591). */
+/**
+ * Registers a tenant's connection with Sideshift (RFC 7591). Each tenant gets
+ * its own client, named after the tenant so the founder recognises it on
+ * Sideshift's consent screen.
+ */
 export async function registerClient(
-  redirectUri: string
+  redirectUri: string,
+  clientName: string
 ): Promise<RegisteredClient> {
   const response = await sideshiftRequest(
     `${SIDESHIFT_API}/register`,
@@ -39,7 +44,7 @@ export async function registerClient(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        client_name: `${env.TENANT_NAME} dashboard`,
+        client_name: `${clientName} dashboard`,
         client_uri: env.APP_URL,
         redirect_uris: [redirectUri],
         grant_types: ["authorization_code", "refresh_token"],

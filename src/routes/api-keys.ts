@@ -1,4 +1,4 @@
-import { desc, eq } from "drizzle-orm"
+import { and, desc, eq } from "drizzle-orm"
 import { Router } from "express"
 import { z } from "zod"
 
@@ -8,11 +8,19 @@ import { apiKeys } from "../db/schema.js"
 import { generateApiKey, newId } from "../lib/crypto.js"
 import { NotFoundError } from "../lib/errors.js"
 import { serializeApiKey } from "../lib/serializers.js"
-import { getAuth } from "../middleware/auth.js"
+import { getAuth, getScope, getTenantId } from "../middleware/auth.js"
 import { validate } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
 
-export const apiKeysRouter: Router = Router()
+/** Mounted under /apps/:appId: a key belongs to exactly one app. */
+export const apiKeysRouter: Router = Router({ mergeParams: true })
+
+function inApp(scope: { tenantId: string; appId: string }) {
+  return and(
+    eq(apiKeys.tenantId, scope.tenantId),
+    eq(apiKeys.appId, scope.appId)
+  )
+}
 
 apiKeysRouter.get("/scopes", (_req, res) => {
   res.json({
@@ -23,10 +31,11 @@ apiKeysRouter.get("/scopes", (_req, res) => {
   })
 })
 
-apiKeysRouter.get("/", async (_req, res) => {
+apiKeysRouter.get("/", async (req, res) => {
   const rows = await db
     .select()
     .from(apiKeys)
+    .where(inApp(getScope(req)))
     .orderBy(desc(apiKeys.createdAt))
 
   res.json({ data: rows.map(serializeApiKey) })
@@ -49,6 +58,7 @@ apiKeysRouter.post(
   }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const { tenantId, appId } = getScope(req)
     const body = req.body as {
       name: string
       scopes: string[]
@@ -61,6 +71,8 @@ apiKeysRouter.post(
       .insert(apiKeys)
       .values({
         id: newId(),
+        tenantId,
+        appId,
         name: body.name,
         prefix: generated.prefix,
         keyHash: generated.hash,
@@ -75,11 +87,12 @@ apiKeysRouter.post(
     }
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "created",
       section: "user-management",
       summary: `Created API key ${body.name}`,
-      metadata: { scopes: body.scopes },
+      metadata: { appId, scopes: body.scopes },
       ipAddress: req.ip,
     })
 
@@ -98,12 +111,13 @@ apiKeysRouter.post(
   validate({ params: z.object({ id: z.string().min(1) }) }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
     const id = req.params.id as string
 
     const [row] = await db
       .update(apiKeys)
       .set({ revokedAt: new Date() })
-      .where(eq(apiKeys.id, id))
+      .where(and(inApp(getScope(req)), eq(apiKeys.id, id)))
       .returning()
 
     if (!row) {
@@ -111,6 +125,7 @@ apiKeysRouter.post(
     }
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "updated",
       section: "user-management",
@@ -127,21 +142,20 @@ apiKeysRouter.delete(
   validate({ params: z.object({ id: z.string().min(1) }) }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
     const id = req.params.id as string
+    const thisKey = and(inApp(getScope(req)), eq(apiKeys.id, id))
 
-    const [row] = await db
-      .select()
-      .from(apiKeys)
-      .where(eq(apiKeys.id, id))
-      .limit(1)
+    const [row] = await db.select().from(apiKeys).where(thisKey).limit(1)
 
     if (!row) {
       throw new NotFoundError("API key")
     }
 
-    await db.delete(apiKeys).where(eq(apiKeys.id, id))
+    await db.delete(apiKeys).where(thisKey)
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "deleted",
       section: "user-management",

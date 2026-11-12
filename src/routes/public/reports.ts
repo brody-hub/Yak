@@ -8,10 +8,15 @@ import { generatePublicToken, newId } from "../../lib/crypto.js"
 import { BadRequestError, NotFoundError } from "../../lib/errors.js"
 import { serializeReportForApi } from "../../lib/serializers.js"
 import { getApiKey, requireApiKey } from "../../middleware/api-key.js"
+import { getScope } from "../../middleware/auth.js"
 import { ingestLimiter } from "../../middleware/rate-limit.js"
 import { validate, validatedQuery } from "../../middleware/validate.js"
 import { fireDiscordTrigger } from "../../services/discord.js"
+import { loadApp, nextReportNumber } from "../../services/tenants.js"
 import { dispatchWebhookEvent } from "../../services/webhooks.js"
+
+/** The key's tenant and app, which every query here is confined to. */
+type Scope = { tenantId: string; appId: string }
 
 export const publicReportsRouter: Router = Router()
 
@@ -51,24 +56,63 @@ function isUniqueViolation(error: unknown): boolean {
   )
 }
 
-async function findByIdempotencyKey(key: string) {
+async function findByIdempotencyKey(scope: Scope, key: string) {
   const [row] = await db
     .select()
     .from(reports)
-    .where(eq(reports.idempotencyKey, key))
+    .where(
+      and(
+        eq(reports.tenantId, scope.tenantId),
+        eq(reports.appId, scope.appId),
+        eq(reports.idempotencyKey, key)
+      )
+    )
     .limit(1)
 
   if (!row) {
     return null
   }
 
-  const messages = await db
+  return serializeReportForApi(row, await loadMessages(scope, row.id))
+}
+
+async function loadMessages(scope: Scope, reportId: string) {
+  return db
     .select()
     .from(reportMessages)
-    .where(eq(reportMessages.reportId, row.id))
+    .where(
+      and(
+        eq(reportMessages.tenantId, scope.tenantId),
+        eq(reportMessages.appId, scope.appId),
+        eq(reportMessages.reportId, reportId)
+      )
+    )
     .orderBy(asc(reportMessages.createdAt))
+}
 
-  return serializeReportForApi(row, messages)
+/**
+ * Looks a report up by its public token. The token is random, but the lookup
+ * is still confined to the calling key's app so one key can never read a
+ * report that belongs to another customer, or to another of their apps.
+ */
+async function findByToken(scope: Scope, token: string) {
+  const [row] = await db
+    .select()
+    .from(reports)
+    .where(
+      and(
+        eq(reports.tenantId, scope.tenantId),
+        eq(reports.appId, scope.appId),
+        eq(reports.publicToken, token)
+      )
+    )
+    .limit(1)
+
+  if (!row) {
+    throw new NotFoundError("Report")
+  }
+
+  return row
 }
 
 const REPORT_TYPE_LABELS = {
@@ -121,6 +165,8 @@ publicReportsRouter.post(
   }),
   async (req, res) => {
     const apiKey = getApiKey(req)
+    const scope = getScope(req)
+    const { tenantId, appId } = scope
     const body = req.body as {
       type: "bug" | "suggestion" | "support" | "report"
       subject: string
@@ -135,7 +181,7 @@ publicReportsRouter.post(
     const idempotencyKey = readIdempotencyKey(req)
 
     if (idempotencyKey) {
-      const replay = await findByIdempotencyKey(idempotencyKey)
+      const replay = await findByIdempotencyKey(scope, idempotencyKey)
 
       if (replay) {
         res.status(200).json({ data: replay })
@@ -149,6 +195,9 @@ publicReportsRouter.post(
           .insert(reports)
           .values({
             id: newId(),
+            tenantId,
+            appId,
+            number: await nextReportNumber(tx, tenantId),
             type: body.type,
             status: "open",
             priority: body.priority,
@@ -175,6 +224,8 @@ publicReportsRouter.post(
         // continuous conversation.
         await tx.insert(reportMessages).values({
           id: newId(),
+          tenantId,
+          appId,
           reportId: created.id,
           authorType: "user",
           authorName: body.reporter.name,
@@ -192,7 +243,7 @@ publicReportsRouter.post(
       // Two copies of the same request raced; the other one won the insert.
       const replay =
         idempotencyKey && isUniqueViolation(error)
-          ? await findByIdempotencyKey(idempotencyKey)
+          ? await findByIdempotencyKey(scope, idempotencyKey)
           : null
 
       if (!replay) {
@@ -203,12 +254,11 @@ publicReportsRouter.post(
       return
     }
 
-    const messages = await db
-      .select()
-      .from(reportMessages)
-      .where(eq(reportMessages.reportId, row.id))
+    const messages = await loadMessages(scope, row.id)
+    const app = await loadApp(tenantId, appId)
+    const origin = { id: app.id, name: app.name }
 
-    void fireDiscordTrigger("new_support", {
+    void fireDiscordTrigger(tenantId, "new_support", {
       title: `${REPORT_TYPE_LABELS[row.type]} #${row.number}`,
       description: row.subject,
       fields: [
@@ -221,18 +271,24 @@ publicReportsRouter.post(
         { name: "Priority", value: row.priority, inline: true },
         { name: "Platform", value: row.platform ?? "Unknown", inline: true },
       ],
+      app: origin,
     })
 
-    void dispatchWebhookEvent("report.created", {
-      report: {
-        id: row.id,
-        number: row.number,
-        type: row.type,
-        status: row.status,
-        priority: row.priority,
-        subject: row.subject,
+    void dispatchWebhookEvent(
+      tenantId,
+      "report.created",
+      {
+        report: {
+          id: row.id,
+          number: row.number,
+          type: row.type,
+          status: row.status,
+          priority: row.priority,
+          subject: row.subject,
+        },
       },
-    })
+      { app: origin }
+    )
 
     res.status(201).json({ data: serializeReportForApi(row, messages) })
   }
@@ -245,21 +301,9 @@ publicReportsRouter.get(
   ingestLimiter,
   validate({ params: tokenParamSchema }),
   async (req, res) => {
-    const [row] = await db
-      .select()
-      .from(reports)
-      .where(eq(reports.publicToken, req.params.token as string))
-      .limit(1)
-
-    if (!row) {
-      throw new NotFoundError("Report")
-    }
-
-    const messages = await db
-      .select()
-      .from(reportMessages)
-      .where(eq(reportMessages.reportId, row.id))
-      .orderBy(asc(reportMessages.createdAt))
+    const scope = getScope(req)
+    const row = await findByToken(scope, req.params.token as string)
+    const messages = await loadMessages(scope, row.id)
 
     res.json({ data: serializeReportForApi(row, messages) })
   }
@@ -272,22 +316,13 @@ publicReportsRouter.post(
   ingestLimiter,
   validate({
     params: tokenParamSchema,
-    body: z
-      .object({ body: z.string().trim().min(1).max(10_000) })
-      .strict(),
+    body: z.object({ body: z.string().trim().min(1).max(10_000) }).strict(),
   }),
   async (req, res) => {
     const { body } = req.body as { body: string }
-
-    const [row] = await db
-      .select()
-      .from(reports)
-      .where(eq(reports.publicToken, req.params.token as string))
-      .limit(1)
-
-    if (!row) {
-      throw new NotFoundError("Report")
-    }
+    const scope = getScope(req)
+    const { tenantId, appId } = scope
+    const row = await findByToken(scope, req.params.token as string)
 
     if (row.status === "closed") {
       throw new BadRequestError("This report is closed")
@@ -296,6 +331,8 @@ publicReportsRouter.post(
     const updated = await db.transaction(async (tx) => {
       await tx.insert(reportMessages).values({
         id: newId(),
+        tenantId,
+        appId,
         reportId: row.id,
         authorType: "user",
         authorName: row.reporterName,
@@ -309,7 +346,13 @@ publicReportsRouter.post(
           status: row.status === "waiting" ? "open" : row.status,
           updatedAt: new Date(),
         })
-        .where(eq(reports.id, row.id))
+        .where(
+          and(
+            eq(reports.tenantId, tenantId),
+            eq(reports.appId, appId),
+            eq(reports.id, row.id)
+          )
+        )
         .returning()
 
       return next
@@ -319,16 +362,22 @@ publicReportsRouter.post(
       throw new NotFoundError("Report")
     }
 
-    const messages = await db
-      .select()
-      .from(reportMessages)
-      .where(eq(reportMessages.reportId, updated.id))
-      .orderBy(asc(reportMessages.createdAt))
+    const messages = await loadMessages(scope, updated.id)
+    const app = await loadApp(tenantId, appId)
 
-    void dispatchWebhookEvent("report.replied", {
-      report: { id: updated.id, number: updated.number, status: updated.status },
-      message: { author: "user", authorName: updated.reporterName, body },
-    })
+    void dispatchWebhookEvent(
+      tenantId,
+      "report.replied",
+      {
+        report: {
+          id: updated.id,
+          number: updated.number,
+          status: updated.status,
+        },
+        message: { author: "user", authorName: updated.reporterName, body },
+      },
+      { app: { id: app.id, name: app.name } }
+    )
 
     res.status(201).json({ data: serializeReportForApi(updated, messages) })
   }
@@ -357,7 +406,10 @@ publicReportsRouter.get(
       limit: number
     }>(req)
 
+    const { tenantId, appId } = getScope(req)
     const conditions = [
+      eq(reports.tenantId, tenantId),
+      eq(reports.appId, appId),
       query.email ? eq(reports.reporterEmail, query.email) : undefined,
       query.externalUserId
         ? eq(reports.externalUserId, query.externalUserId)

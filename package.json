@@ -18,7 +18,8 @@
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
     "seed": "tsx src/scripts/seed.ts",
-    "create:owner": "tsx src/scripts/create-owner.ts"
+    "create:owner": "tsx src/scripts/create-owner.ts",
+    "create:super-admin": "tsx src/scripts/create-owner.ts --super-admin"
   },
   "keywords": [],
   "author": "",

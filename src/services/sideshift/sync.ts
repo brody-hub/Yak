@@ -10,6 +10,7 @@ import {
   type SideshiftCampaign,
   type SideshiftConnection,
 } from "../../db/schema.js"
+import { withTenantScope } from "../../db/scope.js"
 import { logger } from "../../logger.js"
 import { getResource, SideshiftError, type QueryValue } from "./client.js"
 import {
@@ -79,7 +80,9 @@ export function isSyncing(row: SideshiftConnection | undefined) {
 }
 
 function startedWithin(row: SideshiftConnection, ms: number) {
-  return Boolean(row.syncStartedAt && Date.now() - row.syncStartedAt.getTime() < ms)
+  return Boolean(
+    row.syncStartedAt && Date.now() - row.syncStartedAt.getTime() < ms
+  )
 }
 
 /** Whether the Refresh button may start a sync right now. */
@@ -104,77 +107,123 @@ const IMMEDIATE_LOCK_WAIT_MS = 5 * 60_000
 /**
  * Runs one sync if the trigger allows it and nobody else is syncing. Never
  * throws: failures are recorded on the connection for the Marketing tab.
+ *
+ * Opens its own tenant scope: a sync is started from a request but outlives
+ * it, and the request's connection goes back to the pool when the response
+ * ends. The scope holds one connection for the whole sync.
  */
-export async function runSync(trigger: SyncTrigger): Promise<"ran" | "skipped"> {
-  const result = await withSideshiftLock(async () => {
-    const row = await loadConnection()
+export function runSync(
+  tenantId: string,
+  trigger: SyncTrigger
+): Promise<"ran" | "skipped"> {
+  return withTenantScope(tenantId, () => runSyncScoped(tenantId, trigger))
+}
 
-    if (!row || row.status === "disconnected" || row.status === "needs_reconnect") {
-      return "skipped" as const
-    }
+async function runSyncScoped(
+  tenantId: string,
+  trigger: SyncTrigger
+): Promise<"ran" | "skipped"> {
+  const result = await withSideshiftLock(
+    tenantId,
+    async () => {
+      const row = await loadConnection(tenantId)
 
-    if (trigger === "auto") {
-      // A lapsed subscription pauses automatic syncing; Refresh still retries.
       if (
-        row.status === "subscription_inactive" ||
-        startedWithin(row, AUTO_SYNC_COOLDOWN_MS)
+        !row ||
+        row.status === "disconnected" ||
+        row.status === "needs_reconnect"
       ) {
         return "skipped" as const
       }
-    }
 
-    if (trigger === "manual" && !canRefreshNow(row)) {
-      return "skipped" as const
-    }
+      if (trigger === "auto") {
+        // A lapsed subscription pauses automatic syncing; Refresh still retries.
+        if (
+          row.status === "subscription_inactive" ||
+          startedWithin(row, AUTO_SYNC_COOLDOWN_MS)
+        ) {
+          return "skipped" as const
+        }
+      }
 
-    const startedAt = new Date()
-    await updateConnection({ syncStartedAt: startedAt })
+      if (trigger === "manual" && !canRefreshNow(row)) {
+        return "skipped" as const
+      }
 
-    try {
-      await syncAll(new Session(), startedAt)
-      await updateConnection({
-        status: "connected",
-        lastSyncedAt: new Date(),
-        lastError: null,
-        lastErrorAt: null,
-        lastErrorRequestId: null,
-      })
-      logger.info(
-        { trigger, ms: Date.now() - startedAt.getTime() },
-        "Sideshift sync complete"
-      )
-    } catch (error) {
-      await recordFailure(error)
-    }
+      const startedAt = new Date()
+      await updateConnection(tenantId, { syncStartedAt: startedAt })
 
-    return "ran" as const
-  }, { waitMs: trigger === "immediate" ? IMMEDIATE_LOCK_WAIT_MS : 0 })
+      try {
+        await syncAll(new Session(tenantId), startedAt)
+        await updateConnection(tenantId, {
+          status: "connected",
+          lastSyncedAt: new Date(),
+          lastError: null,
+          lastErrorAt: null,
+          lastErrorRequestId: null,
+        })
+        logger.info(
+          { tenantId, trigger, ms: Date.now() - startedAt.getTime() },
+          "Sideshift sync complete"
+        )
+      } catch (error) {
+        await recordFailure(tenantId, error)
+      }
+
+      return "ran" as const
+    },
+    { waitMs: trigger === "immediate" ? IMMEDIATE_LOCK_WAIT_MS : 0 }
+  )
 
   return result.acquired ? result.value : "skipped"
 }
 
+/**
+ * Syncs in flight or waiting for the lock, per tenant. A second request to
+ * sync a tenant that already has one pending joins it instead of leasing
+ * another connection, so repeated clicks cannot drain the pool.
+ */
+const pendingSyncs = new Map<string, Promise<"ran" | "skipped">>()
+
 /** Fire and forget, for request handlers that must not wait on Sideshift. */
-export function startSync(trigger: SyncTrigger) {
-  void runSync(trigger).catch((error: unknown) => {
-    logger.error({ err: error }, "Sideshift sync crashed")
-  })
+export function startSync(tenantId: string, trigger: SyncTrigger) {
+  if (pendingSyncs.has(tenantId)) {
+    return
+  }
+
+  const run = runSync(tenantId, trigger)
+    .catch((error: unknown) => {
+      logger.error({ err: error, tenantId }, "Sideshift sync crashed")
+      return "skipped" as const
+    })
+    .finally(() => {
+      pendingSyncs.delete(tenantId)
+    })
+
+  pendingSyncs.set(tenantId, run)
 }
 
 /* -------------------------------------------------------------------------- */
 /* Authenticated session                                                       */
 /* -------------------------------------------------------------------------- */
 
-/** One sync's access token, refreshed once on a 401 before giving up. */
+/**
+ * One sync's access token, refreshed once on a 401 before giving up. Also
+ * carries the tenant the sync is for, so every step reads and writes only
+ * that tenant's rows.
+ */
 class Session {
   private token: string | null = null
   private retriedAfter401 = false
+
+  constructor(readonly tenantId: string) {}
 
   async get(
     path: string,
     query?: Record<string, QueryValue>,
     accept?: string
   ): Promise<Response> {
-    this.token ??= await getAccessToken()
+    this.token ??= await getAccessToken(this.tenantId)
 
     try {
       return await getResource(this.token, path, query, accept)
@@ -185,7 +234,7 @@ class Session {
         !this.retriedAfter401
       ) {
         this.retriedAfter401 = true
-        this.token = await getAccessToken({ force: true })
+        this.token = await getAccessToken(this.tenantId, { force: true })
         return getResource(this.token, path, query, accept)
       }
 
@@ -213,7 +262,11 @@ async function syncAll(session: Session, startedAt: Date) {
   await syncDaily(session, tracked, posts)
 }
 
-type CursorPage<T> = { data: T[]; nextCursor?: string | null; hasMore?: boolean }
+type CursorPage<T> = {
+  data: T[]
+  nextCursor?: string | null
+  hasMore?: boolean
+}
 
 /** Walks a cursor-paginated list endpoint to the end, within a page cap. */
 async function listAll<T>(session: Session, path: string): Promise<T[]> {
@@ -234,7 +287,10 @@ async function listAll<T>(session: Session, path: string): Promise<T[]> {
     }
   }
 
-  logger.warn({ path, count: items.length }, "Sideshift list truncated")
+  logger.warn(
+    { tenantId: session.tenantId, path, count: items.length },
+    "Sideshift list truncated"
+  )
   return items
 }
 
@@ -245,6 +301,7 @@ async function listAll<T>(session: Session, path: string): Promise<T[]> {
  * that disappear from the list are flagged and dropped from tracking.
  */
 async function syncCampaigns(session: Session): Promise<SideshiftCampaign[]> {
+  const { tenantId } = session
   const listed = await listAll<{ id: string; name: string; status: string }>(
     session,
     "/analytics/campaigns"
@@ -258,6 +315,7 @@ async function syncCampaigns(session: Session): Promise<SideshiftCampaign[]> {
       .insert(sideshiftCampaigns)
       .values(
         chunk.map((campaign) => ({
+          tenantId,
           id: campaign.id,
           name: campaign.name || "Untitled campaign",
           status: campaign.status || "unknown",
@@ -266,7 +324,7 @@ async function syncCampaigns(session: Session): Promise<SideshiftCampaign[]> {
         }))
       )
       .onConflictDoUpdate({
-        target: sideshiftCampaigns.id,
+        target: [sideshiftCampaigns.tenantId, sideshiftCampaigns.id],
         set: {
           name: sql`excluded.name`,
           status: sql`excluded.status`,
@@ -277,7 +335,10 @@ async function syncCampaigns(session: Session): Promise<SideshiftCampaign[]> {
   }
 
   const listedIds = new Set(listed.map((campaign) => campaign.id))
-  const existing = await db.select().from(sideshiftCampaigns)
+  const existing = await db
+    .select()
+    .from(sideshiftCampaigns)
+    .where(eq(sideshiftCampaigns.tenantId, tenantId))
   const removed = existing
     .filter((campaign) => !listedIds.has(campaign.id) && !campaign.removedAt)
     .map((campaign) => campaign.id)
@@ -285,15 +346,45 @@ async function syncCampaigns(session: Session): Promise<SideshiftCampaign[]> {
   if (removed.length > 0) {
     await db
       .update(sideshiftCampaigns)
-      .set({ removedAt: now, tracked: false, historyBackfilledAt: null, updatedAt: now })
-      .where(inArray(sideshiftCampaigns.id, removed))
-    await db.delete(sideshiftDaily).where(inArray(sideshiftDaily.campaignId, removed))
-    await db
-      .delete(sideshiftPostDaily)
-      .where(inArray(sideshiftPostDaily.campaignId, removed))
+      .set({
+        removedAt: now,
+        tracked: false,
+        historyBackfilledAt: null,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(sideshiftCampaigns.tenantId, tenantId),
+          inArray(sideshiftCampaigns.id, removed)
+        )
+      )
+    await forgetHistory(tenantId, removed)
   }
 
-  return db.select().from(sideshiftCampaigns)
+  return db
+    .select()
+    .from(sideshiftCampaigns)
+    .where(eq(sideshiftCampaigns.tenantId, tenantId))
+}
+
+/** Drops the daily history kept for some of a tenant's campaigns. */
+async function forgetHistory(tenantId: string, campaignIds: string[]) {
+  await db
+    .delete(sideshiftDaily)
+    .where(
+      and(
+        eq(sideshiftDaily.tenantId, tenantId),
+        inArray(sideshiftDaily.campaignId, campaignIds)
+      )
+    )
+  await db
+    .delete(sideshiftPostDaily)
+    .where(
+      and(
+        eq(sideshiftPostDaily.tenantId, tenantId),
+        inArray(sideshiftPostDaily.campaignId, campaignIds)
+      )
+    )
 }
 
 async function syncCreators(session: Session) {
@@ -309,6 +400,7 @@ async function syncCreators(session: Session) {
       .insert(sideshiftCreators)
       .values(
         creators.slice(index, index + WRITE_CHUNK).map((creator) => ({
+          tenantId: session.tenantId,
           id: creator.id,
           name: creator.name || "Unknown creator",
           avatarUrl: safeUrl(creator.avatarUrl),
@@ -316,7 +408,7 @@ async function syncCreators(session: Session) {
         }))
       )
       .onConflictDoUpdate({
-        target: sideshiftCreators.id,
+        target: [sideshiftCreators.tenantId, sideshiftCreators.id],
         set: {
           name: sql`excluded.name`,
           avatarUrl: sql`excluded.avatar_url`,
@@ -381,7 +473,9 @@ function safeUrl(value: string | null | undefined) {
 
   try {
     const url = new URL(value)
-    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : null
+    return url.protocol === "https:" || url.protocol === "http:"
+      ? url.toString()
+      : null
   } catch {
     return null
   }
@@ -407,13 +501,16 @@ async function syncPosts(
 
   for (const campaign of tracked) {
     for (let page = 1; page <= MAX_POST_PAGES; page += 1) {
-      const body = await session.json<{ data?: VideoPage }>("/analytics/videos", {
-        programId: campaign.id,
-        page,
-        limit: PAGE_SIZE,
-        sortBy: "uploadedAt",
-        sortOrder: "desc",
-      })
+      const body = await session.json<{ data?: VideoPage }>(
+        "/analytics/videos",
+        {
+          programId: campaign.id,
+          page,
+          limit: PAGE_SIZE,
+          sortBy: "uploadedAt",
+          sortOrder: "desc",
+        }
+      )
       const envelope = body.data ?? {}
       const rows = envelope.data ?? []
 
@@ -434,6 +531,7 @@ async function syncPosts(
         }
 
         posts.set(id, {
+          tenantId: session.tenantId,
           id,
           platformPostId: row.postId ?? null,
           platform: row.platform || "unknown",
@@ -458,7 +556,7 @@ async function syncPosts(
 
       if (page === MAX_POST_PAGES) {
         logger.warn(
-          { campaignId: campaign.id },
+          { tenantId: session.tenantId, campaignId: campaign.id },
           "Sideshift campaign has more posts than one sync reads; the oldest are skipped"
         )
       }
@@ -480,7 +578,7 @@ async function syncPosts(
           }))
       )
       .onConflictDoUpdate({
-        target: sideshiftPosts.id,
+        target: [sideshiftPosts.tenantId, sideshiftPosts.id],
         set: {
           platform: sql`excluded.platform`,
           creatorId: sql`excluded.creator_id`,
@@ -500,7 +598,14 @@ async function syncPosts(
       })
   }
 
-  await db.delete(sideshiftPosts).where(lt(sideshiftPosts.updatedAt, startedAt))
+  await db
+    .delete(sideshiftPosts)
+    .where(
+      and(
+        eq(sideshiftPosts.tenantId, session.tenantId),
+        lt(sideshiftPosts.updatedAt, startedAt)
+      )
+    )
 
   return posts
 }
@@ -553,13 +658,18 @@ async function syncDaily(
       .set({ historyBackfilledAt: new Date() })
       .where(
         and(
+          eq(sideshiftCampaigns.tenantId, session.tenantId),
           inArray(sideshiftCampaigns.id, ids),
           eq(sideshiftCampaigns.tracked, true)
         )
       )
   }
 
-  for (let index = 0; index < incremental.length; index += MAX_CAMPAIGN_FILTER) {
+  for (
+    let index = 0;
+    index < incremental.length;
+    index += MAX_CAMPAIGN_FILTER
+  ) {
     const ids = incremental
       .slice(index, index + MAX_CAMPAIGN_FILTER)
       .map((campaign) => campaign.id)
@@ -618,7 +728,8 @@ export function parseCsv(text: string): string[][] {
   return rows.filter((entry) => entry.some((value) => value !== ""))
 }
 
-const normalize = (header: string) => header.toLowerCase().replace(/[^a-z0-9]/g, "")
+const normalize = (header: string) =>
+  header.toLowerCase().replace(/[^a-z0-9]/g, "")
 
 /**
  * Sideshift documents this export as "postId, date, cumulative
@@ -638,12 +749,22 @@ function historyColumns(header: string[]) {
     campaign: find("programid", "campaignid"),
     views: find("viewsdelta", "deltaviews", "viewschange", "dailyviews"),
     likes: find("likesdelta", "deltalikes", "likeschange", "dailylikes"),
-    comments: find("commentsdelta", "deltacomments", "commentschange", "dailycomments"),
+    comments: find(
+      "commentsdelta",
+      "deltacomments",
+      "commentschange",
+      "dailycomments"
+    ),
     shares: find("sharesdelta", "deltashares", "shareschange", "dailyshares"),
   }
 }
 
-type DailyTotals = { views: number; likes: number; comments: number; shares: number }
+type DailyTotals = {
+  views: number
+  likes: number
+  comments: number
+  shares: number
+}
 
 /**
  * Pulls the post-level daily history for some campaigns and replaces their
@@ -673,8 +794,15 @@ async function syncHistory(
 
   const columns = historyColumns(header)
 
-  if (columns.post === null || columns.date === null || columns.views === null) {
-    logger.error({ header }, "Unrecognised Sideshift metrics-history columns")
+  if (
+    columns.post === null ||
+    columns.date === null ||
+    columns.views === null
+  ) {
+    logger.error(
+      { tenantId: session.tenantId, header },
+      "Unrecognised Sideshift metrics-history columns"
+    )
     throw new SideshiftError(
       200,
       "unexpected_format",
@@ -729,13 +857,18 @@ async function syncHistory(
     }
   }
 
+  const { tenantId } = session
   const values = Array.from(totals, ([key, entry]) => {
     const [campaignId, date] = key.split("|") as [string, string]
-    return { campaignId, date, ...entry }
+    return { tenantId, campaignId, date, ...entry }
   })
   const postValues = Array.from(postTotals, ([key, entry]) => {
-    const [postId, campaignId, date] = key.split("|") as [string, string, string]
-    return { postId, campaignId, date, ...entry }
+    const [postId, campaignId, date] = key.split("|") as [
+      string,
+      string,
+      string,
+    ]
+    return { tenantId, postId, campaignId, date, ...entry }
   })
 
   await db.transaction(async (tx) => {
@@ -743,6 +876,7 @@ async function syncHistory(
       .delete(sideshiftDaily)
       .where(
         and(
+          eq(sideshiftDaily.tenantId, tenantId),
           inArray(sideshiftDaily.campaignId, campaignIds),
           between(sideshiftDaily.date, fromDate, toDate)
         )
@@ -751,13 +885,16 @@ async function syncHistory(
       .delete(sideshiftPostDaily)
       .where(
         and(
+          eq(sideshiftPostDaily.tenantId, tenantId),
           inArray(sideshiftPostDaily.campaignId, campaignIds),
           between(sideshiftPostDaily.date, fromDate, toDate)
         )
       )
 
     for (let index = 0; index < values.length; index += WRITE_CHUNK) {
-      await tx.insert(sideshiftDaily).values(values.slice(index, index + WRITE_CHUNK))
+      await tx
+        .insert(sideshiftDaily)
+        .values(values.slice(index, index + WRITE_CHUNK))
     }
 
     for (let index = 0; index < postValues.length; index += WRITE_CHUNK) {
@@ -773,7 +910,12 @@ function accumulate(
   key: string,
   gained: DailyTotals
 ) {
-  const entry = totals.get(key) ?? { views: 0, likes: 0, comments: 0, shares: 0 }
+  const entry = totals.get(key) ?? {
+    views: 0,
+    likes: 0,
+    comments: 0,
+    shares: 0,
+  }
 
   entry.views += gained.views
   entry.likes += gained.likes
@@ -782,19 +924,25 @@ function accumulate(
   totals.set(key, entry)
 }
 
-/** Clears every cached campaign, post and daily row. */
-export async function clearSideshiftCache() {
+/** Clears every cached campaign, post and daily row for one tenant. */
+export async function clearSideshiftCache(tenantId: string) {
   await db.transaction(async (tx) => {
-    await tx.delete(sideshiftPostDaily)
-    await tx.delete(sideshiftDaily)
-    await tx.delete(sideshiftPosts)
-    await tx.delete(sideshiftCreators)
-    await tx.delete(sideshiftCampaigns)
+    await tx
+      .delete(sideshiftPostDaily)
+      .where(eq(sideshiftPostDaily.tenantId, tenantId))
+    await tx.delete(sideshiftDaily).where(eq(sideshiftDaily.tenantId, tenantId))
+    await tx.delete(sideshiftPosts).where(eq(sideshiftPosts.tenantId, tenantId))
+    await tx
+      .delete(sideshiftCreators)
+      .where(eq(sideshiftCreators.tenantId, tenantId))
+    await tx
+      .delete(sideshiftCampaigns)
+      .where(eq(sideshiftCampaigns.tenantId, tenantId))
   })
 }
 
 /** Stops tracking campaigns and forgets their history so re-tracking backfills. */
-export async function untrackCampaigns(ids: string[]) {
+export async function untrackCampaigns(tenantId: string, ids: string[]) {
   if (ids.length === 0) {
     return
   }
@@ -802,12 +950,16 @@ export async function untrackCampaigns(ids: string[]) {
   await db
     .update(sideshiftCampaigns)
     .set({ tracked: false, historyBackfilledAt: null, updatedAt: new Date() })
-    .where(inArray(sideshiftCampaigns.id, ids))
-  await db.delete(sideshiftDaily).where(inArray(sideshiftDaily.campaignId, ids))
-  await db.delete(sideshiftPostDaily).where(inArray(sideshiftPostDaily.campaignId, ids))
+    .where(
+      and(
+        eq(sideshiftCampaigns.tenantId, tenantId),
+        inArray(sideshiftCampaigns.id, ids)
+      )
+    )
+  await forgetHistory(tenantId, ids)
 }
 
-export async function trackCampaigns(ids: string[]) {
+export async function trackCampaigns(tenantId: string, ids: string[]) {
   if (ids.length === 0) {
     return
   }
@@ -815,5 +967,11 @@ export async function trackCampaigns(ids: string[]) {
   await db
     .update(sideshiftCampaigns)
     .set({ tracked: true, updatedAt: new Date() })
-    .where(and(inArray(sideshiftCampaigns.id, ids), eq(sideshiftCampaigns.tracked, false)))
+    .where(
+      and(
+        eq(sideshiftCampaigns.tenantId, tenantId),
+        inArray(sideshiftCampaigns.id, ids),
+        eq(sideshiftCampaigns.tracked, false)
+      )
+    )
 }

@@ -1,7 +1,8 @@
-import { eq } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 
 import { db } from "../db/index.js"
 import { discordTriggers } from "../db/schema.js"
+import { withTenantScope } from "../db/scope.js"
 import { decryptSecret } from "../lib/crypto.js"
 import { logger } from "../logger.js"
 
@@ -81,6 +82,8 @@ export type TriggerPayload = {
   title: string
   description?: string
   fields?: { name: string; value: string; inline?: boolean }[]
+  /** The app the event came from, named in the embed. Account-level triggers leave it out. */
+  app?: { id: string; name: string }
 }
 
 /**
@@ -89,70 +92,97 @@ export type TriggerPayload = {
  * Fire and forget by design: a Discord outage must never fail the panel action
  * or ingest request that triggered it. Failures are recorded on the trigger row
  * so the settings UI can surface them.
+ *
+ * Runs in its own database scope because it usually outlives the request that
+ * started it, whose scope is released when the response closes.
  */
-export async function fireDiscordTrigger(
+export function fireDiscordTrigger(
+  tenantId: string,
   trigger: DiscordTriggerId,
   payload: TriggerPayload
 ): Promise<void> {
-  try {
-    const [config] = await db
-      .select()
-      .from(discordTriggers)
-      .where(eq(discordTriggers.trigger, trigger))
-      .limit(1)
+  return withTenantScope(tenantId, async () => {
+    const thisTrigger = and(
+      eq(discordTriggers.tenantId, tenantId),
+      eq(discordTriggers.trigger, trigger)
+    )
 
-    if (!config?.enabled || !config.webhookUrlEncrypted) {
-      return
-    }
+    try {
+      const [config] = await db
+        .select()
+        .from(discordTriggers)
+        .where(thisTrigger)
+        .limit(1)
 
-    const url = decryptSecret(config.webhookUrlEncrypted)
+      if (!config?.enabled || !config.webhookUrlEncrypted) {
+        return
+      }
 
-    if (!isValidDiscordWebhookUrl(url)) {
-      logger.warn({ trigger }, "Stored Discord webhook URL is no longer valid")
-      return
-    }
+      const url = decryptSecret(
+        config.webhookUrlEncrypted,
+        discordBinding(tenantId)
+      )
 
-    const embed: DiscordEmbed = {
-      title: payload.title,
-      color: TRIGGER_COLORS[trigger],
-      timestamp: new Date().toISOString(),
-      ...(payload.description ? { description: payload.description } : {}),
-      ...(payload.fields?.length ? { fields: payload.fields } : {}),
-    }
+      if (!isValidDiscordWebhookUrl(url)) {
+        logger.warn(
+          { trigger },
+          "Stored Discord webhook URL is no longer valid"
+        )
+        return
+      }
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ embeds: [embed] }),
-      signal: AbortSignal.timeout(8_000),
-    })
+      const fields = [
+        ...(payload.fields ?? []),
+        ...(payload.app
+          ? [{ name: "App", value: payload.app.name, inline: true }]
+          : []),
+      ]
 
-    if (!response.ok) {
-      const detail = `Discord responded ${response.status}`
-      logger.warn({ trigger, status: response.status }, "Discord webhook failed")
+      const embed: DiscordEmbed = {
+        title: payload.title,
+        color: TRIGGER_COLORS[trigger],
+        timestamp: new Date().toISOString(),
+        ...(payload.description ? { description: payload.description } : {}),
+        ...(fields.length ? { fields } : {}),
+      }
+
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ embeds: [embed] }),
+        signal: AbortSignal.timeout(8_000),
+      })
+
+      if (!response.ok) {
+        const detail = `Discord responded ${response.status}`
+        logger.warn(
+          { trigger, status: response.status },
+          "Discord webhook failed"
+        )
+        await db
+          .update(discordTriggers)
+          .set({ lastError: detail })
+          .where(thisTrigger)
+        return
+      }
+
       await db
         .update(discordTriggers)
-        .set({ lastError: detail })
-        .where(eq(discordTriggers.trigger, trigger))
-      return
+        .set({ lastFiredAt: new Date(), lastError: null })
+        .where(thisTrigger)
+    } catch (error) {
+      logger.warn({ err: error, trigger }, "Discord trigger dispatch failed")
+
+      await db
+        .update(discordTriggers)
+        .set({
+          lastError:
+            error instanceof Error ? error.message : "Unknown dispatch error",
+        })
+        .where(thisTrigger)
+        .catch(() => undefined)
     }
-
-    await db
-      .update(discordTriggers)
-      .set({ lastFiredAt: new Date(), lastError: null })
-      .where(eq(discordTriggers.trigger, trigger))
-  } catch (error) {
-    logger.warn({ err: error, trigger }, "Discord trigger dispatch failed")
-
-    await db
-      .update(discordTriggers)
-      .set({
-        lastError:
-          error instanceof Error ? error.message : "Unknown dispatch error",
-      })
-      .where(eq(discordTriggers.trigger, trigger))
-      .catch(() => undefined)
-  }
+  })
 }
 
 /** Sends a one-off message so an operator can verify their URL works. */
@@ -192,4 +222,9 @@ export async function sendDiscordTestMessage(
       error: error instanceof Error ? error.message : "Could not reach Discord",
     }
   }
+}
+
+/** What a stored Discord webhook URL is sealed to; see encryptSecret. */
+export function discordBinding(tenantId: string): string {
+  return `${tenantId}:discord`
 }

@@ -4,33 +4,33 @@ import { z } from "zod"
 
 import { db } from "../db/index.js"
 import { appSettings } from "../db/schema.js"
-import { env } from "../env.js"
 import { BadRequestError } from "../lib/errors.js"
 import { serializeSettings } from "../lib/serializers.js"
-import { getAuth } from "../middleware/auth.js"
+import { getAuth, getTenantId } from "../middleware/auth.js"
 import { validate } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
-import { imageExists, isManagedObjectKey } from "../services/r2.js"
+import { imageExists, isTenantObjectKey } from "../services/r2.js"
+import { loadTenant } from "../services/tenants.js"
 
 export const settingsRouter: Router = Router()
 
-const SETTINGS_ID = "default"
-
-/** Reads the singleton settings row, creating it on first access. */
-export async function loadSettings() {
+/** Reads the tenant's settings row, creating it on first access. */
+export async function loadSettings(tenantId: string) {
   const [existing] = await db
     .select()
     .from(appSettings)
-    .where(eq(appSettings.id, SETTINGS_ID))
+    .where(eq(appSettings.tenantId, tenantId))
     .limit(1)
 
   if (existing) {
     return existing
   }
 
+  const tenant = await loadTenant(tenantId)
+
   const [created] = await db
     .insert(appSettings)
-    .values({ id: SETTINGS_ID, brandName: env.TENANT_NAME })
+    .values({ tenantId, brandName: tenant.name })
     .onConflictDoNothing()
     .returning()
 
@@ -42,7 +42,7 @@ export async function loadSettings() {
   const [row] = await db
     .select()
     .from(appSettings)
-    .where(eq(appSettings.id, SETTINGS_ID))
+    .where(eq(appSettings.tenantId, tenantId))
     .limit(1)
 
   if (!row) {
@@ -52,8 +52,8 @@ export async function loadSettings() {
   return row
 }
 
-settingsRouter.get("/theme", async (_req, res) => {
-  const row = await loadSettings()
+settingsRouter.get("/theme", async (req, res) => {
+  const row = await loadSettings(getTenantId(req))
   res.json({ data: serializeSettings(row) })
 })
 
@@ -78,6 +78,7 @@ settingsRouter.put(
   }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
     const body = req.body as {
       brandName?: string
       primaryColor?: string
@@ -85,10 +86,13 @@ settingsRouter.put(
       logoImageId?: string | null
     }
 
-    await loadSettings()
+    const current = await loadSettings(tenantId)
 
-    if (body.logoImageId) {
-      if (!isManagedObjectKey(body.logoImageId)) {
+    // A logo must have been uploaded into this tenant's prefix. Re-sending the
+    // logo already stored is allowed, which keeps logos uploaded before the
+    // multi-tenant key layout working.
+    if (body.logoImageId && body.logoImageId !== current.logoImageId) {
+      if (!isTenantObjectKey(body.logoImageId, tenantId, "branding")) {
         throw new BadRequestError("Invalid image reference")
       }
 
@@ -102,10 +106,11 @@ settingsRouter.put(
     const [row] = await db
       .update(appSettings)
       .set({ ...body, updatedByUserId: user.id, updatedAt: new Date() })
-      .where(eq(appSettings.id, SETTINGS_ID))
+      .where(eq(appSettings.tenantId, tenantId))
       .returning()
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "updated",
       section: "theme",

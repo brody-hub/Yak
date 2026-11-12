@@ -1,6 +1,6 @@
 import { betterAuth } from "better-auth"
 import { drizzleAdapter } from "better-auth/adapters/drizzle"
-import { admin as adminPlugin } from "better-auth/plugins"
+import { APIError } from "better-auth/api"
 import { eq } from "drizzle-orm"
 
 import { db } from "../db/index.js"
@@ -11,13 +11,12 @@ import {
   sendPasswordChangedEmail,
   sendPasswordResetEmail,
 } from "../services/email.js"
-import { ac, authRoles } from "./access.js"
 
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 const SESSION_REFRESH_SECONDS = 60 * 60 * 24
 
 export const auth = betterAuth({
-  appName: env.TENANT_NAME,
+  appName: env.APP_NAME,
   baseURL: env.API_URL,
   basePath: "/api/auth",
   secret: env.BETTER_AUTH_SECRET,
@@ -35,8 +34,9 @@ export const auth = betterAuth({
 
   emailAndPassword: {
     enabled: true,
-    // This panel is invite only. Accounts are created by an owner or admin
-    // through POST /api/system-users, never by the person signing in.
+    // This panel is invite only. Accounts are created by a super admin
+    // (/api/admin) or a tenant's owner or admin (/api/system-users), never by
+    // the person signing in.
     disableSignUp: true,
     requireEmailVerification: false,
     minPasswordLength: 12,
@@ -67,6 +67,15 @@ export const auth = betterAuth({
 
   user: {
     additionalFields: {
+      // None of these can be set through a Better Auth endpoint (`input:
+      // false`); only our own tenant-aware routes write them.
+      //
+      // Which customer the account belongs to. Null only for super admins.
+      tenantId: { type: "string", required: false, input: false },
+      role: { type: "string", required: false, defaultValue: "member", input: false },
+      banned: { type: "boolean", required: false, defaultValue: false, input: false },
+      banReason: { type: "string", required: false, input: false },
+      banExpires: { type: "date", required: false, input: false },
       permissions: {
         type: "string[]",
         required: false,
@@ -110,10 +119,11 @@ export const auth = betterAuth({
       secure: env.isProduction,
       partitioned: env.isProduction,
     },
-    cookiePrefix: env.TENANT_SLUG,
+    cookiePrefix: env.cookiePrefix,
     ipAddress: {
-      // Railway terminates TLS at its edge proxy.
-      ipAddressHeaders: ["x-forwarded-for", "x-real-ip"],
+      // Set by betterAuthHandler from Express's proxy-aware `req.ip`; any
+      // client-supplied value is discarded before Better Auth sees it.
+      ipAddressHeaders: ["x-forwarded-for"],
     },
   },
 
@@ -132,6 +142,22 @@ export const auth = betterAuth({
   databaseHooks: {
     session: {
       create: {
+        // A deactivated account cannot start a session. (requireAuth also
+        // refuses banned users on every request, so this only keeps a dead
+        // session from being issued in the first place.)
+        before: async (newSession) => {
+          const [row] = await db
+            .select({ banned: schema.user.banned })
+            .from(schema.user)
+            .where(eq(schema.user.id, newSession.userId))
+            .limit(1)
+
+          if (!row || row.banned) {
+            throw new APIError("FORBIDDEN", {
+              message: "This account has been deactivated",
+            })
+          }
+        },
         after: async (createdSession) => {
           await db
             .update(schema.user)
@@ -144,16 +170,6 @@ export const auth = betterAuth({
       },
     },
   },
-
-  plugins: [
-    adminPlugin({
-      ac,
-      roles: authRoles,
-      defaultRole: "member",
-      // Values here must also appear in `roles` above.
-      adminRoles: ["owner", "admin"],
-    }),
-  ],
 })
 
 export type Auth = typeof auth

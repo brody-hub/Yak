@@ -6,9 +6,18 @@ import { db } from "../db/index.js"
 import { appUsers, reportMessages, reports } from "../db/schema.js"
 import { NotFoundError } from "../lib/errors.js"
 import { serializeAppUser, serializeReport } from "../lib/serializers.js"
+import { getScope } from "../middleware/auth.js"
 import { validate, validatedQuery } from "../middleware/validate.js"
 
-export const appUsersRouter: Router = Router()
+/** Mounted under /apps/:appId, so every query here is confined to one app. */
+export const appUsersRouter: Router = Router({ mergeParams: true })
+
+function inApp(scope: { tenantId: string; appId: string }) {
+  return and(
+    eq(appUsers.tenantId, scope.tenantId),
+    eq(appUsers.appId, scope.appId)
+  )
+}
 
 /**
  * Search over the integrating application's end users.
@@ -27,14 +36,19 @@ appUsersRouter.get(
   }),
   async (req, res) => {
     const { q, limit } = validatedQuery<{ q: string; limit: number }>(req)
+    const inTenant = inApp(getScope(req))
 
-    const [roster] = await db.select({ total: count() }).from(appUsers)
+    const [roster] = await db
+      .select({ total: count() })
+      .from(appUsers)
+      .where(inTenant)
     const meta = { total: Number(roster?.total ?? 0) }
 
     if (!q) {
       const recent = await db
         .select()
         .from(appUsers)
+        .where(inTenant)
         .orderBy(desc(appUsers.createdAt))
         .limit(limit)
 
@@ -48,10 +62,13 @@ appUsersRouter.get(
       .select()
       .from(appUsers)
       .where(
-        or(
-          ilike(appUsers.name, pattern),
-          ilike(appUsers.email, pattern),
-          ilike(appUsers.externalId, pattern)
+        and(
+          inTenant,
+          or(
+            ilike(appUsers.name, pattern),
+            ilike(appUsers.email, pattern),
+            ilike(appUsers.externalId, pattern)
+          )
         )
       )
       .orderBy(asc(appUsers.name))
@@ -77,21 +94,24 @@ appUsersRouter.get(
   async (req, res) => {
     const { days } = validatedQuery<{ days: number }>(req)
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
+    const inTenant = inApp(getScope(req))
 
     const byStatus = await db
       .select({ status: appUsers.status, total: count() })
       .from(appUsers)
+      .where(inTenant)
       .groupBy(appUsers.status)
 
     const byPlan = await db
       .select({ plan: appUsers.plan, total: count() })
       .from(appUsers)
+      .where(inTenant)
       .groupBy(appUsers.plan)
 
     const [recent] = await db
       .select({ total: count() })
       .from(appUsers)
-      .where(gte(appUsers.createdAt, since))
+      .where(and(inTenant, gte(appUsers.createdAt, since)))
 
     const statusTotals = { active: 0, trialing: 0, churned: 0 }
     let total = 0
@@ -128,11 +148,13 @@ appUsersRouter.get(
   validate({ params: z.object({ externalId: z.string().min(1) }) }),
   async (req, res) => {
     const externalId = req.params.externalId as string
+    const scope = getScope(req)
+    const { tenantId, appId } = scope
 
     const [row] = await db
       .select()
       .from(appUsers)
-      .where(eq(appUsers.externalId, externalId))
+      .where(and(inApp(scope), eq(appUsers.externalId, externalId)))
       .limit(1)
 
     if (!row) {
@@ -145,26 +167,39 @@ appUsersRouter.get(
       .select()
       .from(reports)
       .where(
-        or(
-          eq(reports.externalUserId, row.externalId),
-          row.email
-            ? and(
-                isNull(reports.externalUserId),
-                eq(reports.reporterEmail, row.email)
-              )
-            : undefined
+        and(
+          eq(reports.tenantId, tenantId),
+          eq(reports.appId, appId),
+          or(
+            eq(reports.externalUserId, row.externalId),
+            row.email
+              ? and(
+                  isNull(reports.externalUserId),
+                  eq(reports.reporterEmail, row.email)
+                )
+              : undefined
+          )
         )
       )
       .orderBy(desc(reports.updatedAt))
       .limit(50)
 
-    const messagesByReport = new Map<string, (typeof reportMessages.$inferSelect)[]>()
+    const messagesByReport = new Map<
+      string,
+      (typeof reportMessages.$inferSelect)[]
+    >()
 
     for (const report of history) {
       const messages = await db
         .select()
         .from(reportMessages)
-        .where(eq(reportMessages.reportId, report.id))
+        .where(
+          and(
+            eq(reportMessages.tenantId, tenantId),
+            eq(reportMessages.appId, appId),
+            eq(reportMessages.reportId, report.id)
+          )
+        )
         .orderBy(asc(reportMessages.createdAt))
 
       messagesByReport.set(report.id, messages)

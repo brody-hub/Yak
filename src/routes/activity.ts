@@ -1,4 +1,4 @@
-import { count, eq } from "drizzle-orm"
+import { and, count, eq } from "drizzle-orm"
 import { Router } from "express"
 import { z } from "zod"
 
@@ -6,6 +6,7 @@ import { db } from "../db/index.js"
 import { activityLog } from "../db/schema.js"
 import { paginated, paginationSchema } from "../lib/pagination.js"
 import { serializeActivity } from "../lib/serializers.js"
+import { getTenantId } from "../middleware/auth.js"
 import { validate, validatedQuery } from "../middleware/validate.js"
 import { listActivity } from "../services/activity.js"
 
@@ -25,7 +26,9 @@ activityRouter.get(
       userId?: string
     }>(req)
 
+    const tenantId = getTenantId(req)
     const rows = await listActivity({
+      tenantId,
       limit: query.limit,
       offset: query.offset,
       ...(query.userId ? { userId: query.userId } : {}),
@@ -34,7 +37,12 @@ activityRouter.get(
     const [totals] = await db
       .select({ total: count() })
       .from(activityLog)
-      .where(query.userId ? eq(activityLog.userId, query.userId) : undefined)
+      .where(
+        and(
+          eq(activityLog.tenantId, tenantId),
+          query.userId ? eq(activityLog.userId, query.userId) : undefined
+        )
+      )
 
     res.json(
       paginated(rows.map(serializeActivity), Number(totals?.total ?? 0), {

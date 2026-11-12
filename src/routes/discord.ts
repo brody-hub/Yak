@@ -1,13 +1,12 @@
-import { eq } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 import { Router } from "express"
 import { z } from "zod"
 
 import { db } from "../db/index.js"
 import { discordTriggers } from "../db/schema.js"
-import { env } from "../env.js"
 import { decryptSecret, encryptSecret } from "../lib/crypto.js"
 import { BadRequestError } from "../lib/errors.js"
-import { getAuth } from "../middleware/auth.js"
+import { getAuth, getTenantId } from "../middleware/auth.js"
 import { validate } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
 import {
@@ -16,6 +15,7 @@ import {
   isValidDiscordWebhookUrl,
   sendDiscordTestMessage,
   webhookUrlHint,
+  discordBinding,
 } from "../services/discord.js"
 
 export const discordRouter: Router = Router()
@@ -27,8 +27,11 @@ const triggerParamSchema = z.object({ trigger: z.enum(DISCORD_TRIGGERS) })
  * flag so the settings form can show state without ever handing the secret
  * back to the browser.
  */
-discordRouter.get("/", async (_req, res) => {
-  const rows = await db.select().from(discordTriggers)
+discordRouter.get("/", async (req, res) => {
+  const rows = await db
+    .select()
+    .from(discordTriggers)
+    .where(eq(discordTriggers.tenantId, getTenantId(req)))
   const byTrigger = new Map(rows.map((row) => [row.trigger, row]))
 
   res.json({
@@ -65,6 +68,7 @@ discordRouter.put(
   }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
     const trigger = req.params.trigger as (typeof DISCORD_TRIGGERS)[number]
     const body = req.body as {
       enabled?: boolean
@@ -80,7 +84,12 @@ discordRouter.put(
     const [existing] = await db
       .select()
       .from(discordTriggers)
-      .where(eq(discordTriggers.trigger, trigger))
+      .where(
+        and(
+          eq(discordTriggers.tenantId, tenantId),
+          eq(discordTriggers.trigger, trigger)
+        )
+      )
       .limit(1)
 
     const urlUpdate =
@@ -89,7 +98,10 @@ discordRouter.put(
         : body.webhookUrl === null
           ? { webhookUrlEncrypted: null, webhookUrlHint: null }
           : {
-              webhookUrlEncrypted: encryptSecret(body.webhookUrl),
+              webhookUrlEncrypted: encryptSecret(
+                body.webhookUrl,
+                discordBinding(tenantId)
+              ),
               webhookUrlHint: webhookUrlHint(body.webhookUrl),
             }
 
@@ -107,6 +119,7 @@ discordRouter.put(
     }
 
     const values = {
+      tenantId,
       trigger,
       enabled: body.enabled ?? existing?.enabled ?? false,
       ...urlUpdate,
@@ -118,10 +131,14 @@ discordRouter.put(
     const [row] = await db
       .insert(discordTriggers)
       .values(values)
-      .onConflictDoUpdate({ target: discordTriggers.trigger, set: values })
+      .onConflictDoUpdate({
+        target: [discordTriggers.tenantId, discordTriggers.trigger],
+        set: values,
+      })
       .returning()
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "updated",
       section: "discord",
@@ -154,6 +171,8 @@ discordRouter.post(
       .default({}),
   }),
   async (req, res) => {
+    const { tenant } = getAuth(req)
+    const tenantId = getTenantId(req)
     const trigger = req.params.trigger as (typeof DISCORD_TRIGGERS)[number]
     const provided = (req.body as { webhookUrl?: string }).webhookUrl
 
@@ -163,17 +182,27 @@ discordRouter.post(
       const [existing] = await db
         .select()
         .from(discordTriggers)
-        .where(eq(discordTriggers.trigger, trigger))
+        .where(
+          and(
+            eq(discordTriggers.tenantId, tenantId),
+            eq(discordTriggers.trigger, trigger)
+          )
+        )
         .limit(1)
 
       if (!existing?.webhookUrlEncrypted) {
-        throw new BadRequestError("No webhook URL is configured for this trigger")
+        throw new BadRequestError(
+          "No webhook URL is configured for this trigger"
+        )
       }
 
-      url = decryptSecret(existing.webhookUrlEncrypted)
+      url = decryptSecret(
+        existing.webhookUrlEncrypted,
+        discordBinding(tenantId)
+      )
     }
 
-    const result = await sendDiscordTestMessage(url, env.TENANT_NAME)
+    const result = await sendDiscordTestMessage(url, tenant?.name ?? "Yak")
 
     if (!result.ok) {
       throw new BadRequestError(result.error)

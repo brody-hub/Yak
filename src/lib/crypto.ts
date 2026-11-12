@@ -13,19 +13,37 @@ import { env } from "../env.js"
 const ALGORITHM = "aes-256-gcm"
 const IV_LENGTH = 12
 const AUTH_TAG_LENGTH = 16
+/** Payloads carrying this prefix were sealed with a binding (see below). */
+const BOUND_VERSION = "v2"
 
 export function newId(): string {
   return randomUUID()
 }
 
 /**
- * Encrypts a secret for storage. Output layout is
- * `base64(iv) . base64(authTag) . base64(ciphertext)` joined by `.` so the
- * pieces can be split without ambiguity.
+ * The row a secret belongs to, e.g. `${tenantId}:${appId}:revenuecat`. It is
+ * authenticated along with the ciphertext, so a ciphertext copied into
+ * another tenant's row (by a bug, a bad migration, or someone with database
+ * access) fails to decrypt there instead of quietly working.
  */
-export function encryptSecret(plaintext: string): string {
+export type SecretBinding = string
+
+/**
+ * Encrypts a secret for storage. Output layout is
+ * `v2 . base64(iv) . base64(authTag) . base64(ciphertext)` joined by `.` so
+ * the pieces can be split without ambiguity.
+ */
+export function encryptSecret(
+  plaintext: string,
+  binding: SecretBinding
+): string {
+  if (!binding) {
+    throw new Error("A secret needs the binding of the row it is stored in")
+  }
+
   const iv = randomBytes(IV_LENGTH)
   const cipher = createCipheriv(ALGORITHM, env.encryptionKey, iv)
+  cipher.setAAD(Buffer.from(binding, "utf8"))
   const ciphertext = Buffer.concat([
     cipher.update(plaintext, "utf8"),
     cipher.final(),
@@ -33,20 +51,31 @@ export function encryptSecret(plaintext: string): string {
   const authTag = cipher.getAuthTag()
 
   return [
+    BOUND_VERSION,
     iv.toString("base64"),
     authTag.toString("base64"),
     ciphertext.toString("base64"),
   ].join(".")
 }
 
-export function decryptSecret(payload: string): string {
+/**
+ * Decrypts a stored secret. Payloads written before bindings existed have
+ * three parts and no binding; they still decrypt, and are re-sealed with a
+ * binding the next time their row is written.
+ */
+export function decryptSecret(payload: string, binding: SecretBinding): string {
   const parts = payload.split(".")
+  const bound = parts.length === 4 && parts[0] === BOUND_VERSION
 
-  if (parts.length !== 3) {
+  if (!bound && parts.length !== 3) {
     throw new Error("Malformed encrypted payload")
   }
 
-  const [ivPart, tagPart, dataPart] = parts as [string, string, string]
+  const [ivPart, tagPart, dataPart] = (bound ? parts.slice(1) : parts) as [
+    string,
+    string,
+    string,
+  ]
   const iv = Buffer.from(ivPart, "base64")
   const authTag = Buffer.from(tagPart, "base64")
   const ciphertext = Buffer.from(dataPart, "base64")
@@ -56,6 +85,14 @@ export function decryptSecret(payload: string): string {
   }
 
   const decipher = createDecipheriv(ALGORITHM, env.encryptionKey, iv)
+
+  if (bound) {
+    if (!binding) {
+      throw new Error("A bound secret needs its binding to decrypt")
+    }
+    decipher.setAAD(Buffer.from(binding, "utf8"))
+  }
+
   decipher.setAuthTag(authTag)
 
   return Buffer.concat([

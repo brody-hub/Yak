@@ -43,7 +43,7 @@ export const errorHandler: ErrorRequestHandler = (error, req, res, _next) => {
     }
 
     if (req.apiKey && INTEGRATION_FAULTS.has(error.status)) {
-      recordApiKeyFailure(req.apiKey.id, req, {
+      recordApiKeyFailure(req.apiKey, req, {
         status: error.status,
         code: error.code,
         detail: failureDetail(error),

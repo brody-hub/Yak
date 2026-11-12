@@ -1,9 +1,7 @@
-import { fromNodeHeaders } from "better-auth/node"
-import { asc, eq } from "drizzle-orm"
+import { and, asc, count, eq } from "drizzle-orm"
 import { Router } from "express"
 import { z } from "zod"
 
-import { auth } from "../auth/auth.js"
 import {
   PANEL_PERMISSIONS,
   ROLE_DESCRIPTIONS,
@@ -13,9 +11,14 @@ import {
   canManageTargetUser,
   isValidRole,
 } from "../auth/permissions.js"
+import { getPlan } from "../billing/plans.js"
 import { db } from "../db/index.js"
-import { session as sessionTable, user as userTable } from "../db/schema.js"
-import { generateTemporaryPassword } from "../lib/crypto.js"
+import { env } from "../env.js"
+import {
+  session as sessionTable,
+  tenants,
+  user as userTable,
+} from "../db/schema.js"
 import {
   BadRequestError,
   ConflictError,
@@ -23,25 +26,30 @@ import {
   NotFoundError,
 } from "../lib/errors.js"
 import { serializeSystemUser } from "../lib/serializers.js"
-import { getAuth } from "../middleware/auth.js"
+import { getAuth, getTenantId } from "../middleware/auth.js"
 import { requireUserManagement } from "../middleware/permissions.js"
 import { validate } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
 import { sendInviteEmail } from "../services/email.js"
+import {
+  createPanelUser,
+  issueTemporaryPassword,
+} from "../services/panel-accounts.js"
 
 export const systemUsersRouter: Router = Router()
 
 const roleSchema = z.enum(USER_ROLES)
-const permissionsSchema = z.array(z.enum(PANEL_PERMISSIONS)).max(
-  PANEL_PERMISSIONS.length
-)
+const permissionsSchema = z
+  .array(z.enum(PANEL_PERMISSIONS))
+  .max(PANEL_PERMISSIONS.length)
 const idParamSchema = z.object({ id: z.string().min(1) })
 
-async function loadUser(id: string) {
+/** Only ever finds users in the caller's own tenant. */
+async function loadUser(tenantId: string, id: string) {
   const [row] = await db
     .select()
     .from(userTable)
-    .where(eq(userTable.id, id))
+    .where(and(eq(userTable.id, id), eq(userTable.tenantId, tenantId)))
     .limit(1)
 
   if (!row) {
@@ -49,6 +57,40 @@ async function loadUser(id: string) {
   }
 
   return row
+}
+
+/**
+ * The plan caps panel seats (Free has one). Counted as every user who can
+ * sign in, so a deactivated teammate frees their seat. Staff adding users
+ * from the admin console are not held to it.
+ */
+async function assertSeatAvailable(tenantId: string) {
+  const [tenant] = await db
+    .select({ plan: tenants.plan })
+    .from(tenants)
+    .where(eq(tenants.id, tenantId))
+    .limit(1)
+
+  if (!tenant) {
+    throw new NotFoundError("Account")
+  }
+
+  const plan = getPlan(tenant.plan)
+
+  if (plan.adminSeats === null) {
+    return
+  }
+
+  const [row] = await db
+    .select({ total: count() })
+    .from(userTable)
+    .where(and(eq(userTable.tenantId, tenantId), eq(userTable.banned, false)))
+
+  if (Number(row?.total ?? 0) >= plan.adminSeats) {
+    throw new ForbiddenError(
+      `Your ${plan.name} plan includes ${plan.adminSeats} admin seat${plan.adminSeats === 1 ? "" : "s"}. Upgrade to add teammates.`
+    )
+  }
 }
 
 /** Static metadata so the panel renders roles and permissions from one source. */
@@ -65,10 +107,11 @@ systemUsersRouter.get("/meta", (_req, res) => {
   })
 })
 
-systemUsersRouter.get("/", async (_req, res) => {
+systemUsersRouter.get("/", async (req, res) => {
   const rows = await db
     .select()
     .from(userTable)
+    .where(eq(userTable.tenantId, getTenantId(req)))
     .orderBy(asc(userTable.createdAt))
 
   res.json({ data: rows.map(serializeSystemUser) })
@@ -78,7 +121,7 @@ systemUsersRouter.get(
   "/:id",
   validate({ params: idParamSchema }),
   async (req, res) => {
-    const row = await loadUser(req.params.id as string)
+    const row = await loadUser(getTenantId(req), req.params.id as string)
     res.json({ data: serializeSystemUser(row) })
   }
 )
@@ -116,58 +159,28 @@ systemUsersRouter.post(
       throw new ForbiddenError("Only an owner can invite another owner")
     }
 
-    const [existing] = await db
-      .select({ id: userTable.id })
-      .from(userTable)
-      .where(eq(userTable.email, body.email))
-      .limit(1)
+    const tenantId = getTenantId(req)
+    await assertSeatAvailable(tenantId)
 
-    if (existing) {
-      throw new ConflictError("Someone with that email already has access")
-    }
-
-    const temporaryPassword = generateTemporaryPassword()
-
-    // Better Auth owns credential creation; the role and permission columns
-    // are ours, so they are written directly afterwards rather than through
-    // the admin plugin's narrower role type.
-    const created = await auth.api.createUser({
-      body: {
-        email: body.email,
-        password: temporaryPassword,
-        name: body.name,
-      },
-      headers: fromNodeHeaders(req.headers),
+    const { user: row, temporaryPassword } = await createPanelUser({
+      tenantId,
+      email: body.email,
+      name: body.name,
+      role: body.role,
+      permissions: body.permissions,
+      invitedByUserId: actor.user.id,
     })
-
-    const [row] = await db
-      .update(userTable)
-      .set({
-        role: body.role,
-        // Owners and admins hold every permission implicitly, so only the
-        // member grant list is worth persisting.
-        permissions: body.role === "member" ? body.permissions : [],
-        mustChangePassword: true,
-        invitedByUserId: actor.user.id,
-        invitedAt: new Date(),
-        emailVerified: true,
-        updatedAt: new Date(),
-      })
-      .where(eq(userTable.id, created.user.id))
-      .returning()
-
-    if (!row) {
-      throw new NotFoundError("User")
-    }
 
     const delivered = await sendInviteEmail({
       to: row.email,
       name: row.name,
       temporaryPassword,
       invitedByName: actor.user.name,
+      workspaceName: actor.tenant?.name ?? "your workspace",
     })
 
     await recordActivity({
+      tenantId,
       userId: actor.user.id,
       action: "invited",
       section: "user-management",
@@ -180,9 +193,11 @@ systemUsersRouter.post(
       data: serializeSystemUser(row),
       meta: {
         inviteEmailSent: delivered,
-        // Always returned so the admin can copy and send it manually even when
-        // the invite email also went out.
-        temporaryPassword,
+        // Only returned when there is no email service at all, so a
+        // development setup stays usable. A failed send in production is
+        // reported, not compensated by showing the inviter the credential.
+        temporaryPassword:
+          delivered || env.email.configured ? null : temporaryPassword,
       },
     })
   }
@@ -206,7 +221,7 @@ systemUsersRouter.patch(
   }),
   async (req, res) => {
     const actor = getAuth(req)
-    const target = await loadUser(req.params.id as string)
+    const target = await loadUser(getTenantId(req), req.params.id as string)
     const targetRole = isValidRole(target.role) ? target.role : "member"
     const body = req.body as {
       name?: string
@@ -239,7 +254,12 @@ systemUsersRouter.patch(
         const owners = await db
           .select({ id: userTable.id })
           .from(userTable)
-          .where(eq(userTable.role, "owner"))
+          .where(
+            and(
+              eq(userTable.role, "owner"),
+              eq(userTable.tenantId, target.tenantId!)
+            )
+          )
 
         if (owners.length <= 1) {
           throw new BadRequestError(
@@ -247,7 +267,6 @@ systemUsersRouter.patch(
           )
         }
       }
-
     }
 
     const nextRole = body.role ?? targetRole
@@ -272,6 +291,7 @@ systemUsersRouter.patch(
     }
 
     await recordActivity({
+      tenantId: target.tenantId,
       userId: actor.user.id,
       action: "updated",
       section: "user-management",
@@ -297,7 +317,7 @@ systemUsersRouter.post(
   }),
   async (req, res) => {
     const actor = getAuth(req)
-    const target = await loadUser(req.params.id as string)
+    const target = await loadUser(getTenantId(req), req.params.id as string)
     const targetRole = isValidRole(target.role) ? target.role : "member"
 
     if (target.id === actor.user.id) {
@@ -327,6 +347,7 @@ systemUsersRouter.post(
     await db.delete(sessionTable).where(eq(sessionTable.userId, target.id))
 
     await recordActivity({
+      tenantId: target.tenantId,
       userId: actor.user.id,
       action: "updated",
       section: "user-management",
@@ -345,7 +366,7 @@ systemUsersRouter.post(
   validate({ params: idParamSchema }),
   async (req, res) => {
     const actor = getAuth(req)
-    const target = await loadUser(req.params.id as string)
+    const target = await loadUser(getTenantId(req), req.params.id as string)
     const targetRole = isValidRole(target.role) ? target.role : "member"
 
     const manage = canManageTargetUser(actor.user, {
@@ -357,6 +378,10 @@ systemUsersRouter.post(
       throw new ForbiddenError(manage.reason)
     }
 
+    if (target.banned) {
+      await assertSeatAvailable(target.tenantId!)
+    }
+
     const [row] = await db
       .update(userTable)
       .set({ banned: false, banReason: null, updatedAt: new Date() })
@@ -364,6 +389,7 @@ systemUsersRouter.post(
       .returning()
 
     await recordActivity({
+      tenantId: target.tenantId,
       userId: actor.user.id,
       action: "updated",
       section: "user-management",
@@ -383,7 +409,7 @@ systemUsersRouter.post(
   validate({ params: idParamSchema }),
   async (req, res) => {
     const actor = getAuth(req)
-    const target = await loadUser(req.params.id as string)
+    const target = await loadUser(getTenantId(req), req.params.id as string)
     const targetRole = isValidRole(target.role) ? target.role : "member"
 
     const manage = canManageTargetUser(actor.user, {
@@ -395,29 +421,27 @@ systemUsersRouter.post(
       throw new ForbiddenError(manage.reason)
     }
 
-    const temporaryPassword = generateTemporaryPassword()
+    // Re-keying someone who already chose their own password would hand the
+    // admin a way into their account. Once an account is in use, only the
+    // password reset email can change it.
+    if (!target.mustChangePassword) {
+      throw new ConflictError(
+        "This user has already signed in. They can reset their password from the sign in screen."
+      )
+    }
 
-    await auth.api.setUserPassword({
-      body: { userId: target.id, newPassword: temporaryPassword },
-      headers: fromNodeHeaders(req.headers),
-    })
-
-    await db
-      .update(userTable)
-      .set({ mustChangePassword: true, invitedAt: new Date() })
-      .where(eq(userTable.id, target.id))
-
-    // The old credential is gone, so any session holding it should be too.
-    await db.delete(sessionTable).where(eq(sessionTable.userId, target.id))
+    const temporaryPassword = await issueTemporaryPassword(target.id)
 
     const delivered = await sendInviteEmail({
       to: target.email,
       name: target.name,
       temporaryPassword,
       invitedByName: actor.user.name,
+      workspaceName: actor.tenant?.name ?? "your workspace",
     })
 
     await recordActivity({
+      tenantId: target.tenantId,
       userId: actor.user.id,
       action: "invited",
       section: "user-management",
@@ -430,7 +454,8 @@ systemUsersRouter.post(
       data: { ok: true },
       meta: {
         inviteEmailSent: delivered,
-        temporaryPassword,
+        temporaryPassword:
+          delivered || env.email.configured ? null : temporaryPassword,
       },
     })
   }
@@ -442,7 +467,7 @@ systemUsersRouter.delete(
   validate({ params: idParamSchema }),
   async (req, res) => {
     const actor = getAuth(req)
-    const target = await loadUser(req.params.id as string)
+    const target = await loadUser(getTenantId(req), req.params.id as string)
     const targetRole = isValidRole(target.role) ? target.role : "member"
 
     if (target.id === actor.user.id) {
@@ -467,6 +492,7 @@ systemUsersRouter.delete(
     await db.delete(userTable).where(eq(userTable.id, target.id))
 
     await recordActivity({
+      tenantId: target.tenantId,
       userId: actor.user.id,
       action: "deleted",
       section: "user-management",

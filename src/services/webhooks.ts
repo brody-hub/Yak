@@ -5,6 +5,7 @@ import { and, eq } from "drizzle-orm"
 
 import { db } from "../db/index.js"
 import { webhookDeliveries, webhookEndpoints } from "../db/schema.js"
+import { withTenantScope } from "../db/scope.js"
 import { decryptSecret, newId, signPayload } from "../lib/crypto.js"
 import { logger } from "../logger.js"
 
@@ -30,11 +31,19 @@ function isPrivateAddress(address: string): boolean {
   if (isIP(address) === 6) {
     const normalized = address.toLowerCase()
     return (
+      normalized === "::" ||
       normalized === "::1" ||
       normalized.startsWith("fc") ||
       normalized.startsWith("fd") ||
       normalized.startsWith("fe80") ||
-      normalized.startsWith("::ffff:")
+      normalized.startsWith("fe9") ||
+      normalized.startsWith("fea") ||
+      normalized.startsWith("feb") ||
+      // IPv4 embedded one way or another: judge the IPv4 part.
+      normalized.startsWith("::ffff:") ||
+      normalized.startsWith("::") ||
+      normalized.startsWith("64:ff9b:") ||
+      normalized.startsWith("2002:")
     )
   }
 
@@ -78,7 +87,11 @@ export async function assertSafeWebhookUrl(value: string): Promise<void> {
 
   const host = parsed.hostname.toLowerCase()
 
-  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".internal")) {
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".internal")
+  ) {
     throw new Error("Webhook URL may not point at an internal host")
   }
 
@@ -100,7 +113,31 @@ export async function assertSafeWebhookUrl(value: string): Promise<void> {
 const MAX_ATTEMPTS = 3
 const RETRY_DELAYS_MS = [1_000, 5_000]
 
+/** Records the outcome of a delivery attempt, in the tenant's own scope. */
+function markDelivery(
+  tenantId: string,
+  deliveryId: string,
+  values: Partial<typeof webhookDeliveries.$inferInsert>
+): Promise<void> {
+  return withTenantScope(tenantId, async () => {
+    await db
+      .update(webhookDeliveries)
+      .set(values)
+      .where(
+        and(
+          eq(webhookDeliveries.tenantId, tenantId),
+          eq(webhookDeliveries.id, deliveryId)
+        )
+      )
+  })
+}
+
+/**
+ * Retries over several seconds, so it holds no database connection between
+ * attempts; each status write opens a short scope of its own.
+ */
 async function deliver(params: {
+  tenantId: string
   deliveryId: string
   url: string
   secret: string
@@ -119,6 +156,10 @@ async function deliver(params: {
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
     try {
+      // Checked again on every attempt, not just when the endpoint was saved:
+      // a hostname can be re-pointed at a private address afterwards.
+      await assertSafeWebhookUrl(params.url)
+
       const response = await fetch(params.url, {
         method: "POST",
         headers: {
@@ -129,20 +170,20 @@ async function deliver(params: {
           "X-Yak-Signature": `v1=${signature}`,
         },
         body,
+        // A redirect could send the signed payload, or the request itself,
+        // somewhere the URL check never saw. A 3xx is a failed delivery.
+        redirect: "manual",
         signal: AbortSignal.timeout(10_000),
       })
 
       if (response.ok) {
-        await db
-          .update(webhookDeliveries)
-          .set({
-            status: "succeeded",
-            attempts: attempt,
-            responseStatus: response.status,
-            deliveredAt: new Date(),
-            error: null,
-          })
-          .where(eq(webhookDeliveries.id, params.deliveryId))
+        await markDelivery(params.tenantId, params.deliveryId, {
+          status: "succeeded",
+          attempts: attempt,
+          responseStatus: response.status,
+          deliveredAt: new Date(),
+          error: null,
+        })
         return
       }
 
@@ -150,27 +191,21 @@ async function deliver(params: {
       const retryable = response.status === 429 || response.status >= 500
 
       if (!retryable || attempt === MAX_ATTEMPTS) {
-        await db
-          .update(webhookDeliveries)
-          .set({
-            status: "failed",
-            attempts: attempt,
-            responseStatus: response.status,
-            error: `Endpoint responded ${response.status}`,
-          })
-          .where(eq(webhookDeliveries.id, params.deliveryId))
+        await markDelivery(params.tenantId, params.deliveryId, {
+          status: "failed",
+          attempts: attempt,
+          responseStatus: response.status,
+          error: `Endpoint responded ${response.status}`,
+        })
         return
       }
     } catch (error) {
       if (attempt === MAX_ATTEMPTS) {
-        await db
-          .update(webhookDeliveries)
-          .set({
-            status: "failed",
-            attempts: attempt,
-            error: error instanceof Error ? error.message : "Request failed",
-          })
-          .where(eq(webhookDeliveries.id, params.deliveryId))
+        await markDelivery(params.tenantId, params.deliveryId, {
+          status: "failed",
+          attempts: attempt,
+          error: error instanceof Error ? error.message : "Request failed",
+        })
         return
       }
     }
@@ -184,52 +219,89 @@ async function deliver(params: {
  * Queues an event to every enabled endpoint subscribed to it.
  *
  * Returns immediately; delivery runs in the background so panel requests are
- * never held open waiting on a third party endpoint.
+ * never held open waiting on a third party endpoint. Runs in its own database
+ * scope because callers fire and forget it past the end of their request.
+ *
+ * `options.app` names the app the event came from; it is added to the payload
+ * as `app: { id, name }` so an endpoint receiving several apps' events can tell
+ * them apart. Account-level events leave it out.
  */
-export async function dispatchWebhookEvent(
+export function dispatchWebhookEvent(
+  tenantId: string,
   event: WebhookEvent,
-  payload: Record<string, unknown>
+  payload: Record<string, unknown>,
+  options: { app?: { id: string; name: string } } = {}
 ): Promise<void> {
-  try {
-    const endpoints = await db
-      .select()
-      .from(webhookEndpoints)
-      .where(eq(webhookEndpoints.enabled, true))
+  const data = options.app
+    ? { app: { id: options.app.id, name: options.app.name }, ...payload }
+    : payload
 
-    const subscribed = endpoints.filter((endpoint) =>
-      endpoint.events.includes(event)
-    )
+  return withTenantScope(tenantId, async () => {
+    try {
+      const endpoints = await db
+        .select()
+        .from(webhookEndpoints)
+        .where(
+          and(
+            eq(webhookEndpoints.tenantId, tenantId),
+            eq(webhookEndpoints.enabled, true)
+          )
+        )
 
-    for (const endpoint of subscribed) {
-      const deliveryId = newId()
+      const subscribed = endpoints.filter((endpoint) =>
+        endpoint.events.includes(event)
+      )
 
-      await db.insert(webhookDeliveries).values({
-        id: deliveryId,
-        endpointId: endpoint.id,
-        event,
-        payload,
-        status: "pending",
-      })
+      for (const endpoint of subscribed) {
+        const deliveryId = newId()
 
-      void deliver({
-        deliveryId,
-        url: endpoint.url,
-        secret: decryptSecret(endpoint.secretEncrypted),
-        event,
-        payload,
-      }).catch((error: unknown) => {
-        logger.warn({ err: error, event }, "Webhook delivery crashed")
-      })
+        await db.insert(webhookDeliveries).values({
+          id: deliveryId,
+          tenantId,
+          endpointId: endpoint.id,
+          event,
+          payload: data,
+          status: "pending",
+        })
+
+        void deliver({
+          tenantId,
+          deliveryId,
+          url: endpoint.url,
+          secret: decryptSecret(
+            endpoint.secretEncrypted,
+            webhookBinding(tenantId)
+          ),
+          event,
+          payload: data,
+        }).catch((error: unknown) => {
+          logger.warn({ err: error, event }, "Webhook delivery crashed")
+        })
+      }
+    } catch (error) {
+      logger.warn({ err: error, event }, "Could not queue webhook event")
     }
-  } catch (error) {
-    logger.warn({ err: error, event }, "Could not queue webhook event")
-  }
+  })
 }
 
-export async function listDeliveries(endpointId: string, limit = 25) {
+export async function listDeliveries(
+  tenantId: string,
+  endpointId: string,
+  limit = 25
+) {
   return db
     .select()
     .from(webhookDeliveries)
-    .where(and(eq(webhookDeliveries.endpointId, endpointId)))
+    .where(
+      and(
+        eq(webhookDeliveries.tenantId, tenantId),
+        eq(webhookDeliveries.endpointId, endpointId)
+      )
+    )
     .limit(limit)
+}
+
+/** What a stored webhook signing secret is sealed to; see encryptSecret. */
+export function webhookBinding(tenantId: string): string {
+  return `${tenantId}:webhook`
 }

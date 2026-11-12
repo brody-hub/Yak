@@ -1,10 +1,10 @@
-import { eq } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 import { Router } from "express"
 import { z } from "zod"
 
 import { db } from "../db/index.js"
 import { dashboardLayouts, type DashboardWidgetConfig } from "../db/schema.js"
-import { getAuth } from "../middleware/auth.js"
+import { getAuth, getTenantId } from "../middleware/auth.js"
 import { validate } from "../middleware/validate.js"
 
 export const dashboardRouter: Router = Router()
@@ -28,7 +28,11 @@ const MAX_ROWS = 400
 
 const layoutSchema = z
   .object({
-    x: z.number().int().min(0).max(GRID_COLS - 1),
+    x: z
+      .number()
+      .int()
+      .min(0)
+      .max(GRID_COLS - 1),
     y: z.number().int().min(0).max(MAX_ROWS),
     w: z.number().int().min(1).max(GRID_COLS),
     h: z.number().int().min(1).max(MAX_ROWS),
@@ -55,7 +59,12 @@ dashboardRouter.get("/layout", async (req, res) => {
   const [row] = await db
     .select()
     .from(dashboardLayouts)
-    .where(eq(dashboardLayouts.userId, user.id))
+    .where(
+      and(
+        eq(dashboardLayouts.tenantId, getTenantId(req)),
+        eq(dashboardLayouts.userId, user.id)
+      )
+    )
     .limit(1)
 
   res.json({
@@ -82,6 +91,7 @@ dashboardRouter.put(
 
     const values = {
       userId: user.id,
+      tenantId: getTenantId(req),
       widgets: body.widgets,
       updatedAt: new Date(),
     }

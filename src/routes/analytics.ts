@@ -1,13 +1,33 @@
-import { and, count, countDistinct, desc, eq, gte, ilike, lt, or, sql } from "drizzle-orm"
+import {
+  and,
+  count,
+  countDistinct,
+  desc,
+  eq,
+  gte,
+  ilike,
+  lt,
+  or,
+  sql,
+} from "drizzle-orm"
 import { Router } from "express"
 import { z } from "zod"
 
 import { db } from "../db/index.js"
 import { analyticsEvents } from "../db/schema.js"
 import { serializeAnalyticsEvent } from "../lib/serializers.js"
+import { getScope } from "../middleware/auth.js"
 import { validate, validatedQuery } from "../middleware/validate.js"
 
-export const analyticsRouter: Router = Router()
+/** Mounted under /apps/:appId, so every query here is confined to one app. */
+export const analyticsRouter: Router = Router({ mergeParams: true })
+
+function inApp(scope: { tenantId: string; appId: string }) {
+  return and(
+    eq(analyticsEvents.tenantId, scope.tenantId),
+    eq(analyticsEvents.appId, scope.appId)
+  )
+}
 
 const windowSchema = z.object({
   days: z.coerce.number().int().min(1).max(90).default(7),
@@ -37,6 +57,7 @@ analyticsRouter.get(
   async (req, res) => {
     const { days } = validatedQuery<{ days: number }>(req)
     const { start, previousStart, startOfToday } = windowBounds(days)
+    const inTenant = inApp(getScope(req))
 
     const [current] = await db
       .select({
@@ -44,13 +65,14 @@ analyticsRouter.get(
         users: countDistinct(analyticsEvents.externalUserId),
       })
       .from(analyticsEvents)
-      .where(gte(analyticsEvents.occurredAt, start))
+      .where(and(inTenant, gte(analyticsEvents.occurredAt, start)))
 
     const [previous] = await db
       .select({ events: count() })
       .from(analyticsEvents)
       .where(
         and(
+          inTenant,
           gte(analyticsEvents.occurredAt, previousStart),
           lt(analyticsEvents.occurredAt, start)
         )
@@ -59,12 +81,12 @@ analyticsRouter.get(
     const [today] = await db
       .select({ events: count() })
       .from(analyticsEvents)
-      .where(gte(analyticsEvents.occurredAt, startOfToday))
+      .where(and(inTenant, gte(analyticsEvents.occurredAt, startOfToday)))
 
     const [top] = await db
       .select({ name: analyticsEvents.name, total: count() })
       .from(analyticsEvents)
-      .where(gte(analyticsEvents.occurredAt, start))
+      .where(and(inTenant, gte(analyticsEvents.occurredAt, start)))
       .groupBy(analyticsEvents.name)
       .orderBy(desc(count()))
       .limit(1)
@@ -91,6 +113,7 @@ analyticsRouter.get(
   async (req, res) => {
     const { days } = validatedQuery<{ days: number }>(req)
     const { start } = windowBounds(days)
+    const inTenant = inApp(getScope(req))
 
     const rows = await db
       .select({
@@ -99,7 +122,7 @@ analyticsRouter.get(
         users: countDistinct(analyticsEvents.externalUserId),
       })
       .from(analyticsEvents)
-      .where(gte(analyticsEvents.occurredAt, start))
+      .where(and(inTenant, gte(analyticsEvents.occurredAt, start)))
       .groupBy(sql`date_trunc('day', ${analyticsEvents.occurredAt})`)
       .orderBy(sql`date_trunc('day', ${analyticsEvents.occurredAt})`)
 
@@ -133,6 +156,7 @@ analyticsRouter.get(
   async (req, res) => {
     const { days, limit } = validatedQuery<{ days: number; limit: number }>(req)
     const { start, previousStart } = windowBounds(days)
+    const inTenant = inApp(getScope(req))
 
     const current = await db
       .select({
@@ -141,7 +165,7 @@ analyticsRouter.get(
         users: countDistinct(analyticsEvents.externalUserId),
       })
       .from(analyticsEvents)
-      .where(gte(analyticsEvents.occurredAt, start))
+      .where(and(inTenant, gte(analyticsEvents.occurredAt, start)))
       .groupBy(analyticsEvents.name)
       .orderBy(desc(count()))
       .limit(limit)
@@ -151,6 +175,7 @@ analyticsRouter.get(
       .from(analyticsEvents)
       .where(
         and(
+          inTenant,
           gte(analyticsEvents.occurredAt, previousStart),
           lt(analyticsEvents.occurredAt, start)
         )
@@ -176,10 +201,11 @@ analyticsRouter.get(
 )
 
 /** Distinct event names, for the filter dropdown in the live stream. */
-analyticsRouter.get("/names", async (_req, res) => {
+analyticsRouter.get("/names", async (req, res) => {
   const rows = await db
     .selectDistinct({ name: analyticsEvents.name })
     .from(analyticsEvents)
+    .where(inApp(getScope(req)))
     .orderBy(analyticsEvents.name)
     .limit(200)
 
@@ -207,6 +233,7 @@ analyticsRouter.get(
     }>(req)
 
     const conditions = [
+      inApp(getScope(req)),
       query.name ? eq(analyticsEvents.name, query.name) : undefined,
       query.platform ? eq(analyticsEvents.platform, query.platform) : undefined,
       query.externalUserId
@@ -224,7 +251,7 @@ analyticsRouter.get(
     const rows = await db
       .select()
       .from(analyticsEvents)
-      .where(conditions.length > 0 ? and(...conditions) : undefined)
+      .where(and(...conditions))
       .orderBy(desc(analyticsEvents.occurredAt))
       .limit(query.limit)
 

@@ -1,12 +1,31 @@
-import type { PanelPermissionId, UserRole } from "./permissions.js"
+import type { AccountRole, PanelPermissionId } from "./permissions.js"
+
+/** The customer account a request acts on. */
+export type TenantContext = {
+  id: string
+  name: string
+  slug: string
+  status: "active" | "suspended"
+}
+
+/** One of the account's apps, once a request has been bound to it. */
+export type AppContext = {
+  id: string
+  tenantId: string
+  name: string
+  slug: string
+  status: "active" | "archived"
+}
 
 /** Resolved identity for a request authenticated with a session cookie. */
 export type AuthContext = {
   user: {
     id: string
+    /** Null only for super admins. */
+    tenantId: string | null
     name: string
     email: string
-    role: UserRole
+    role: AccountRole
     permissions: string[]
     mustChangePassword: boolean
     avatarImageId: string | null
@@ -18,11 +37,16 @@ export type AuthContext = {
   }
   /** Expanded permissions, with the owner/admin implicit grant applied. */
   permissions: PanelPermissionId[]
+  /** The user's tenant. Null for super admins. */
+  tenant: TenantContext | null
 }
 
 /** Resolved identity for a request authenticated with an API key. */
 export type ApiKeyContext = {
   id: string
+  tenantId: string
+  /** The app the key was minted for. Everything it sends lands there. */
+  appId: string
   name: string
   scopes: string[]
 }

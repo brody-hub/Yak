@@ -34,11 +34,11 @@ export async function sendEmail(input: SendEmailInput): Promise<boolean> {
   if (!env.email.configured) {
     // Local development without Cloudflare credentials: log the message so the
     // invite flow is still testable end to end.
+    // The body is never logged: invites and resets carry credentials.
     logger.warn(
       { to: input.to, subject: input.subject },
       "Email service not configured - message not sent"
     )
-    logger.debug({ text: input.text }, "Email body")
     return false
   }
 
@@ -84,7 +84,11 @@ export async function sendEmail(input: SendEmailInput): Promise<boolean> {
   }
 
   logger.info(
-    { to: input.to, subject: input.subject, messageId: payload.result?.message_id },
+    {
+      to: input.to,
+      subject: input.subject,
+      messageId: payload.result?.message_id,
+    },
     "Email sent"
   )
   return true
@@ -116,7 +120,7 @@ function layout(heading: string, bodyHtml: string): string {
                 <h1 style="margin:0 0 16px;font-size:20px;font-weight:600;">${escapeHtml(heading)}</h1>
                 ${bodyHtml}
                 <p style="margin:32px 0 0;font-size:12px;color:#6b7280;">
-                  ${escapeHtml(env.TENANT_NAME)} admin panel
+                  ${escapeHtml(env.APP_NAME)}
                 </p>
               </td>
             </tr>
@@ -139,9 +143,11 @@ export async function sendInviteEmail(params: {
   name: string
   temporaryPassword: string
   invitedByName: string
+  /** The customer workspace they are joining, or the product for super admins. */
+  workspaceName: string
 }): Promise<boolean> {
   const loginUrl = `${env.APP_URL}/login`
-  const tenant = env.TENANT_NAME
+  const tenant = params.workspaceName
 
   const html = layout(
     `You have been invited to ${tenant}`,
@@ -197,7 +203,7 @@ export async function sendPasswordResetEmail(params: {
   )
 
   const text = [
-    `Reset your ${env.TENANT_NAME} password.`,
+    `Reset your ${env.APP_NAME} password.`,
     ``,
     params.resetUrl,
     ``,
@@ -206,7 +212,7 @@ export async function sendPasswordResetEmail(params: {
 
   return sendEmail({
     to: params.to,
-    subject: `Reset your ${env.TENANT_NAME} password`,
+    subject: `Reset your ${env.APP_NAME} password`,
     html,
     text,
   })
@@ -218,7 +224,7 @@ export async function sendPasswordChangedEmail(params: {
   const html = layout(
     "Your password was changed",
     `<p style="margin:0 0 12px;font-size:14px;line-height:1.6;">
-       The password for your ${escapeHtml(env.TENANT_NAME)} account was just changed.
+       The password for your ${escapeHtml(env.APP_NAME)} account was just changed.
      </p>
      <p style="margin:0;font-size:13px;color:#6b7280;line-height:1.6;">
        If this was not you, contact an owner of this workspace immediately.
@@ -227,8 +233,38 @@ export async function sendPasswordChangedEmail(params: {
 
   return sendEmail({
     to: params.to,
-    subject: `Your ${env.TENANT_NAME} password was changed`,
+    subject: `Your ${env.APP_NAME} password was changed`,
     html,
-    text: `The password for your ${env.TENANT_NAME} account was just changed. If this was not you, contact an owner immediately.`,
+    text: `The password for your ${env.APP_NAME} account was just changed. If this was not you, contact an owner immediately.`,
+  })
+}
+
+/**
+ * Tells a tenant's owners that Yak staff added someone to their account, so a
+ * super admin can never quietly give themselves (or anyone) access.
+ */
+export async function sendStaffAddedUserNotice(params: {
+  to: string
+  workspaceName: string
+  addedName: string
+  addedEmail: string
+  role: string
+}): Promise<boolean> {
+  const summary = `${env.APP_NAME} support added ${params.addedName} (${params.addedEmail}) to ${params.workspaceName} as ${params.role}.`
+
+  const html = layout(
+    `Someone was added to ${params.workspaceName}`,
+    `<p style="margin:0 0 12px;font-size:14px;line-height:1.6;">${escapeHtml(summary)}</p>
+     <p style="margin:0;font-size:13px;color:#6b7280;line-height:1.6;">
+       If you did not ask for this, deactivate them under Settings, User
+       management, and contact ${escapeHtml(env.APP_NAME)} support.
+     </p>`
+  )
+
+  return sendEmail({
+    to: params.to,
+    subject: `Someone was added to ${params.workspaceName}`,
+    html,
+    text: `${summary}\n\nIf you did not ask for this, deactivate them under Settings > User management and contact ${env.APP_NAME} support.`,
   })
 }
