@@ -29,11 +29,12 @@ export async function createPanelUser(params: {
   permissions?: string[]
   invitedByUserId?: string | null
   /**
-   * A password the person chose themselves, at sign up. They then neither
-   * get a temporary one nor have to change it, but must verify their email
-   * before they can sign in. Invites are verified by the act of using them.
+   * A self-serve sign up. The login gets no password at all: its owner sets
+   * one through the emailed link, which is also what proves the address is
+   * theirs. So the only password such an account can ever have is one chosen
+   * by whoever reads that inbox, never by whoever filled in the form.
    */
-  password?: string
+  selfServe?: boolean
 }) {
   const email = params.email.trim().toLowerCase()
 
@@ -49,23 +50,26 @@ export async function createPanelUser(params: {
   }
 
   const context = await auth.$context
-  const selfChosen = params.password !== undefined
-  const temporaryPassword = selfChosen ? null : generateTemporaryPassword()
+  const selfServe = params.selfServe === true
+  const temporaryPassword = selfServe ? null : generateTemporaryPassword()
 
   const created = await context.internalAdapter.createUser({
     name: params.name,
     email,
-    emailVerified: !selfChosen,
+    // Invites are verified by being used; a sign up when its password is set.
+    emailVerified: !selfServe,
     tenantId: params.tenantId,
     role: params.role,
   })
 
-  await context.internalAdapter.linkAccount({
-    userId: created.id,
-    accountId: created.id,
-    providerId: "credential",
-    password: await context.password.hash(params.password ?? temporaryPassword!),
-  })
+  if (temporaryPassword) {
+    await context.internalAdapter.linkAccount({
+      userId: created.id,
+      accountId: created.id,
+      providerId: "credential",
+      password: await context.password.hash(temporaryPassword),
+    })
+  }
 
   const [row] = await db
     .update(userTable)
@@ -74,9 +78,9 @@ export async function createPanelUser(params: {
       // Owners and admins hold every permission implicitly, so only the
       // member grant list is worth persisting.
       permissions: params.role === "member" ? (params.permissions ?? []) : [],
-      mustChangePassword: !selfChosen,
+      mustChangePassword: !selfServe,
       invitedByUserId: params.invitedByUserId ?? null,
-      invitedAt: selfChosen ? null : new Date(),
+      invitedAt: selfServe ? null : new Date(),
       updatedAt: new Date(),
     })
     .where(eq(userTable.id, created.id))
@@ -91,7 +95,7 @@ export async function createPanelUser(params: {
 
 /** createPanelUser for an invite, where a temporary password always exists. */
 export async function invitePanelUser(
-  params: Omit<Parameters<typeof createPanelUser>[0], "password">
+  params: Omit<Parameters<typeof createPanelUser>[0], "selfServe">
 ) {
   const created = await createPanelUser(params)
   return { user: created.user, temporaryPassword: created.temporaryPassword! }

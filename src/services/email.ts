@@ -269,36 +269,68 @@ export async function sendStaffAddedUserNotice(params: {
   })
 }
 
-export async function sendVerifyEmail(params: {
+export async function sendFinishSignupEmail(params: {
   to: string
   name: string
-  verifyUrl: string
+  setPasswordUrl: string
 }): Promise<boolean> {
   const html = layout(
-    "Confirm your email",
+    "Finish creating your account",
     `<p style="margin:0 0 12px;font-size:14px;line-height:1.6;">
        Hi ${escapeHtml(params.name)}, thanks for signing up for
-       ${escapeHtml(env.APP_NAME)}. Confirm this is your email address to
-       finish setting up your account. The link expires in 24 hours.
+       ${escapeHtml(env.APP_NAME)}. Choose your password to confirm this
+       email and finish setting up your account. The link expires in one hour.
      </p>
-     ${button(params.verifyUrl, "Confirm email")}
+     ${button(params.setPasswordUrl, "Choose your password")}
      <p style="margin:0;font-size:13px;color:#6b7280;line-height:1.6;">
-       If you did not sign up, you can ignore this email.
+       If you did not sign up, you can ignore this email; no account is
+       created until a password is chosen.
      </p>`
   )
 
   const text = [
-    `Confirm your email to finish setting up your ${env.APP_NAME} account.`,
+    `Choose your password to finish creating your ${env.APP_NAME} account.`,
     ``,
-    params.verifyUrl,
+    params.setPasswordUrl,
     ``,
-    `The link expires in 24 hours. If you did not sign up, ignore this email.`,
+    `The link expires in one hour. If you did not sign up, ignore this email.`,
   ].join("\n")
 
   return sendEmail({
     to: params.to,
-    subject: `Confirm your email for ${env.APP_NAME}`,
+    subject: `Finish creating your ${env.APP_NAME} account`,
     html,
     text,
+  })
+}
+
+/**
+ * Someone tried to sign up with an email that already has an account. Told
+ * by email rather than on the sign up form, so the form never reveals who
+ * has an account.
+ */
+export async function sendAccountExistsEmail(params: {
+  to: string
+}): Promise<boolean> {
+  const signInUrl = `${env.APP_URL}/login`
+
+  const html = layout(
+    "You already have an account",
+    `<p style="margin:0 0 12px;font-size:14px;line-height:1.6;">
+       Someone tried to sign up for ${escapeHtml(env.APP_NAME)} with this
+       email, which already has an account. If it was you, sign in instead;
+       if you have forgotten your password, reset it from the sign in screen.
+     </p>
+     ${button(signInUrl, "Sign in")}
+     <p style="margin:0;font-size:13px;color:#6b7280;line-height:1.6;">
+       If it was not you, you can ignore this email. Nothing has changed.
+     </p>`
+  )
+
+  return sendEmail({
+    to: params.to,
+    subject: `You already have a ${env.APP_NAME} account`,
+    html,
+    text: `Someone tried to sign up for ${env.APP_NAME} with this email, which already has an account. Sign in at ${signInUrl}. If it was not you, ignore this email.`,
   })
 }
