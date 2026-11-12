@@ -9,8 +9,8 @@ import { env } from "../env.js"
 import { logger } from "../logger.js"
 import {
   sendPasswordChangedEmail,
+  sendFinishSignupEmail,
   sendPasswordResetEmail,
-  sendVerifyEmail,
 } from "../services/email.js"
 
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
@@ -39,7 +39,8 @@ export const auth = betterAuth({
     // created by /api/signup (a new owner with their account), a super admin
     // (/api/admin), or a tenant's owner or admin (/api/system-users).
     disableSignUp: true,
-    // Only sign ups start unverified; invites are verified by being used.
+    // Only sign ups start unverified, and they have no password until the
+    // emailed link sets one, which verifies them. Belt and braces.
     requireEmailVerification: true,
     minPasswordLength: 12,
     maxPasswordLength: 128,
@@ -48,45 +49,42 @@ export const auth = betterAuth({
     // other session for that user has to die with it.
     revokeSessionsOnPasswordReset: true,
     sendResetPassword: async ({ user, token }) => {
-      await sendPasswordResetEmail({
-        to: user.email,
-        resetUrl: `${env.APP_URL}/reset-password?token=${encodeURIComponent(token)}`,
-      })
+      const resetUrl = `${env.APP_URL}/reset-password?token=${encodeURIComponent(token)}`
+
+      // A sign up that has not set its password yet: the same link, worded as
+      // the last step of creating the account.
+      if (!user.emailVerified) {
+        const sent = await sendFinishSignupEmail({
+          to: user.email,
+          name: user.name,
+          setPasswordUrl: `${resetUrl}&welcome=1`,
+        })
+
+        if (!sent && !env.email.configured && !env.isProduction) {
+          // Local development only: there is no inbox to click through.
+          logger.info({ to: user.email, resetUrl }, "Sign up password link")
+        }
+        return
+      }
+
+      await sendPasswordResetEmail({ to: user.email, resetUrl })
     },
     onPasswordReset: async ({ user }) => {
       // Completing a reset satisfies the forced-change requirement that an
-      // invite puts on the account.
+      // invite puts on the account, and proves the email belongs to whoever
+      // set the password, which is what verifies a sign up.
       await db
         .update(schema.user)
-        .set({ mustChangePassword: false, updatedAt: new Date() })
+        .set({
+          mustChangePassword: false,
+          emailVerified: true,
+          updatedAt: new Date(),
+        })
         .where(eq(schema.user.id, user.id))
 
       await sendPasswordChangedEmail({ to: user.email }).catch((error) => {
         logger.warn({ err: error }, "Password change notification failed")
       })
-    },
-  },
-
-  emailVerification: {
-    // Signing in unverified answers 403 and sends a fresh link.
-    sendOnSignIn: true,
-    // The link opens the panel, which calls verify-email itself, so the
-    // session cookie lands in the panel's partition like any other sign in.
-    autoSignInAfterVerification: true,
-    expiresIn: 60 * 60 * 24,
-    sendVerificationEmail: async ({ user, token }) => {
-      const verifyUrl = `${env.APP_URL}/verify-email?token=${encodeURIComponent(token)}`
-
-      const sent = await sendVerifyEmail({
-        to: user.email,
-        name: user.name,
-        verifyUrl,
-      })
-
-      if (!sent && !env.email.configured && !env.isProduction) {
-        // Local development only: there is no inbox to click through.
-        logger.info({ to: user.email, verifyUrl }, "Email verification link")
-      }
     },
   },
 
@@ -161,8 +159,6 @@ export const auth = betterAuth({
       "/request-password-reset": { window: 600, max: 5 },
       "/reset-password": { window: 600, max: 10 },
       "/change-password": { window: 600, max: 10 },
-      "/send-verification-email": { window: 600, max: 5 },
-      "/verify-email": { window: 600, max: 20 },
     },
   },
 

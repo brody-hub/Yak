@@ -258,6 +258,17 @@ export async function resetSuperAdminFromEnv(): Promise<ResetPasswordResult | nu
     return { status: "skipped", reason: "SUPER_ADMIN_EMAIL not set" }
   }
 
+  // Only ever a super admin: an environment variable must not be a way to
+  // re-key a customer's login (and print its password to the deploy log).
+  const owner = await emailOwner(env.SUPER_ADMIN_EMAIL.trim().toLowerCase())
+
+  if (owner?.role !== SUPER_ADMIN_ROLE) {
+    return {
+      status: "skipped",
+      reason: `${env.SUPER_ADMIN_EMAIL} is not a super admin`,
+    }
+  }
+
   return resetAccountPassword(env.SUPER_ADMIN_EMAIL)
 }
 

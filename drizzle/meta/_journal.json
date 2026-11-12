@@ -57,6 +57,13 @@
       "when": 1794462738309,
       "tag": "0007_self_serve_signup",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1794464648335,
+      "tag": "0008_tenant_row_guard",
+      "breakpoints": true
     }
   ]
 }

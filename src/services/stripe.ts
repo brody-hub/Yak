@@ -4,7 +4,7 @@ import Stripe from "stripe"
 import { getPlan, PLAN_IDS } from "../billing/plans.js"
 import { db } from "../db/index.js"
 import { type PlanTier, type Tenant, tenants } from "../db/schema.js"
-import { withTenantScope } from "../db/scope.js"
+import { withStaffScope } from "../db/scope.js"
 import { env } from "../env.js"
 import {
   BadRequestError,
@@ -270,7 +270,9 @@ export async function syncSubscription(subscriptionId: string) {
   const plan = planFromLookupKey(price?.lookup_key)
   const isCurrent = tenant.stripeSubscriptionId === subscription.id
 
-  await withTenantScope(tenant.id, async (scoped) => {
+  // Staff scope: the tier and subscription are not the tenant's to set, and
+  // the tenants row guard (migration 0008) refuses them from tenant scope.
+  await withStaffScope(async (scoped) => {
     if (PAID_STATUSES.has(subscription.status)) {
       if (!plan) {
         logger.error(

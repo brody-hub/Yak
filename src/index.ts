@@ -42,9 +42,17 @@ try {
 
   if (bootstrap?.status === "created") {
     console.error(`[boot] super admin created for ${bootstrap.email}`)
-    if (!bootstrap.inviteEmailSent) {
+    if (bootstrap.inviteEmailSent) {
+      console.error("[boot] temporary password emailed")
+    } else if (!env.email.configured) {
+      // Only without an email service. A failed send with email configured
+      // is not compensated by printing a live credential to the deploy log.
       console.error(`[boot] temporary password: ${bootstrap.temporaryPassword}`)
       console.error("[boot] change it immediately after signing in")
+    } else {
+      console.error(
+        "[boot] the invite email could not be sent; set SUPER_ADMIN_RESET_PASSWORD=true for one deploy once email works"
+      )
     }
   } else if (bootstrap?.status === "exists") {
     console.error(`[boot] super admin already exists (${bootstrap.email})`)

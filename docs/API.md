@@ -24,7 +24,7 @@ Paginated endpoints return:
 | --- | --- | --- |
 | GET | `/health` | Liveness plus a database check. `503` if the database is unreachable. |
 | GET | `/api/config` | Product name, password policy, `signUpEnabled`, `paymentsEnabled` and the public `plans` ladder, for the landing, sign up and login screens. The same for every tenant, since those screens cannot know which one is signing in. |
-| POST | `/api/signup` | `{ accountName, name, email, password, plan?, interval? }`. Self-serve sign up; `404` unless `SIGNUP_ENABLED`. Creates the account on Free with its first app and its owner (unverified), and emails a confirmation link. A paid `plan` (`starter` to `studio`) is kept as the account's pending plan and paid for through checkout after sign in; `scale` is refused. `409` if the email is taken, unless it belongs to a sign up left unconfirmed for over 24 hours, which is removed. Limited to 5 per hour per IP. |
+| POST | `/api/signup` | `{ accountName, name, email, plan?, interval? }`. Self-serve sign up; `404` unless `SIGNUP_ENABLED`. Creates the account on Free with its first app and its owner, who has no password yet, and emails a link to choose one (the password reset flow); choosing it verifies the email. The form never sets a password, so signing up with someone else's email gains nothing. Always `201` with the same body: a sign up whose password was never set is replaced, and an email that already has an account is told so by email instead, so the form reveals nothing about who uses Yak. A paid `plan` (`starter` to `studio`) is kept as the account's pending plan and paid for through checkout after sign in; `scale` is refused. Limited to 5 per hour per IP. |
 | POST | `/api/stripe/webhook` | Stripe's webhook, authenticated by its signature. Handles `checkout.session.completed` and `customer.subscription.*` by re-reading the subscription and copying its tier and status onto the account. |
 | GET | `/api/sideshift/callback` | Sideshift's OAuth redirect. Authenticated by the one-time `state` from `POST /api/sideshift/connect`, not the session. Parks the authorization code and redirects to `APP_URL/marketing?sideshift=confirm&sideshift_state=…`, where the user who clicked Connect finishes with `POST /api/sideshift/complete`. On failure redirects to `APP_URL/marketing?sideshift=<outcome>`. |
 
@@ -42,14 +42,13 @@ its admin plugin) answers `404`, and the request is rebuilt server side so
 | POST | `/api/auth/sign-out` | Clears the session. |
 | GET | `/api/auth/get-session` | Current session, or `null`. |
 | POST | `/api/auth/request-password-reset` | `{ email, redirectTo }`. Always succeeds, so it cannot be used to enumerate accounts. |
-| POST | `/api/auth/reset-password` | `{ token, newPassword }`. Revokes all other sessions. |
-| POST | `/api/auth/send-verification-email` | `{ email }`. Sends a fresh confirmation link to an unconfirmed sign up. Always succeeds. |
-| GET | `/api/auth/verify-email?token=…` | Confirms the email from a sign up link and signs the owner in. Called by the panel's `/verify-email` page, never opened on the API host, so the session cookie lands in the panel's partition. Any `callbackURL` is dropped. |
+| POST | `/api/auth/reset-password` | `{ token, newPassword }`. Revokes all other sessions, and marks the email verified. |
 
-Signing in requires a confirmed email. Invited logins are confirmed by the
-invite; a sign up gets `403 EMAIL_NOT_VERIFIED` and a fresh link until the
-owner opens one. Better Auth's own sign up endpoint stays closed:
-`/api/signup` creates the account and owner together.
+Signing in requires a verified email. Invited logins are verified by the
+invite; a sign up is verified when its owner chooses a password from the
+emailed link (`request-password-reset` sends a fresh one). Better Auth's own
+sign up and email verification endpoints stay closed: `/api/signup` creates
+the account and owner together.
 
 ## Tenancy, apps and isolation
 

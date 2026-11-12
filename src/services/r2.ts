@@ -76,6 +76,11 @@ function getClient(): S3Client {
     client = new S3Client({
       region: "auto",
       endpoint: `https://${host}`,
+      // The browser uploads to the presigned URL itself, so the SDK cannot
+      // compute a body checksum; without this it would sign the checksum of
+      // an empty body into the URL.
+      requestChecksumCalculation: "WHEN_REQUIRED",
+      responseChecksumValidation: "WHEN_REQUIRED",
       credentials: {
         accessKeyId: cfg.accessKeyId,
         secretAccessKey: cfg.secretAccessKey,
@@ -169,7 +174,9 @@ export async function createDirectUpload(params: {
   })
 
   // Content type and length are part of the signature, so the URL can only
-  // store an object of this type and exactly this size.
+  // store an object of this type and exactly this size. The SDK leaves
+  // Content-Type out of the signature unless told to sign it, which would let
+  // the uploader store HTML or SVG under an image key.
   const command = new PutObjectCommand({
     Bucket: bucket,
     Key: key,
@@ -179,6 +186,7 @@ export async function createDirectUpload(params: {
 
   const uploadUrl = await getSignedUrl(getClient(), command, {
     expiresIn: 10 * 60,
+    signableHeaders: new Set(["content-type"]),
   })
 
   return {
@@ -248,9 +256,21 @@ export async function createSignedReadUrl(
 ): Promise<string> {
   const { bucket } = requireConfigured()
 
+  // Served as the image type its key names, whatever was stored, so an
+  // object can never be rendered as a page from a Yak media link.
+  const ext = imageId.split(".").pop()?.toLowerCase() ?? ""
+  const type =
+    Object.entries(EXT_BY_TYPE).find(([, value]) => value === ext)?.[0] ??
+    "application/octet-stream"
+
   return getSignedUrl(
     getClient(),
-    new GetObjectCommand({ Bucket: bucket, Key: imageId }),
+    new GetObjectCommand({
+      Bucket: bucket,
+      Key: imageId,
+      ResponseContentType: type,
+      ResponseContentDisposition: "inline",
+    }),
     { expiresIn: ttlSeconds }
   )
 }

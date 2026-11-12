@@ -1,5 +1,7 @@
+import { lookup as lookupCallback, type LookupAddress } from "node:dns"
 import { lookup } from "node:dns/promises"
-import { isIP } from "node:net"
+import { request as httpsRequest } from "node:https"
+import { isIP, type LookupFunction } from "node:net"
 
 import { and, eq } from "drizzle-orm"
 
@@ -106,6 +108,77 @@ export async function assertSafeWebhookUrl(value: string): Promise<void> {
   }
 }
 
+/**
+ * Resolves like dns.lookup but refuses private addresses, and is the lookup
+ * the request itself connects with. Checking the name once and then letting
+ * the HTTP client resolve it again would let a hostname with a near-zero TTL
+ * answer publicly for the check and privately for the connection.
+ */
+const publicOnlyLookup: LookupFunction = (hostname, options, callback) => {
+  lookupCallback(hostname, { ...options, all: true }, (error, addresses) => {
+    if (error) {
+      callback(error, "", 4)
+      return
+    }
+
+    const list = addresses as LookupAddress[]
+
+    if (list.length === 0 || list.some((entry) => isPrivateAddress(entry.address))) {
+      callback(
+        new Error("Webhook URL may not point at a private network address"),
+        "",
+        4
+      )
+      return
+    }
+
+    if (options.all) {
+      ;(callback as unknown as (error: null, addresses: LookupAddress[]) => void)(
+        null,
+        list
+      )
+      return
+    }
+
+    callback(null, list[0]!.address, list[0]!.family)
+  })
+}
+
+/**
+ * POSTs to a customer's endpoint and answers its status code. No redirects
+ * are followed (a 3xx is just a status), so the signed payload only ever
+ * goes to an address the lookup above approved.
+ */
+function postToEndpoint(
+  url: string,
+  headers: Record<string, string>,
+  body: string,
+  timeoutMs: number
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const request = httpsRequest(
+      url,
+      {
+        method: "POST",
+        headers: { ...headers, "Content-Length": Buffer.byteLength(body) },
+        lookup: publicOnlyLookup,
+        timeout: timeoutMs,
+      },
+      (response) => {
+        // The body is never read or stored; drain it so the socket closes.
+        response.resume()
+        resolve(response.statusCode ?? 0)
+      }
+    )
+
+    request.on("timeout", () => {
+      request.destroy(new Error("Endpoint timed out"))
+    })
+    request.on("error", reject)
+    request.end(body)
+  })
+}
+
 /* -------------------------------------------------------------------------- */
 /* Dispatch                                                                    */
 /* -------------------------------------------------------------------------- */
@@ -160,9 +233,13 @@ async function deliver(params: {
       // a hostname can be re-pointed at a private address afterwards.
       await assertSafeWebhookUrl(params.url)
 
-      const response = await fetch(params.url, {
-        method: "POST",
-        headers: {
+      // A redirect could send the signed payload, or the request itself,
+      // somewhere the URL check never saw, so none is followed: a 3xx is a
+      // failed delivery. The connection goes only to an address the lookup
+      // approved at connect time.
+      const status = await postToEndpoint(
+        params.url,
+        {
           "Content-Type": "application/json",
           "X-Yak-Event": params.event,
           "X-Yak-Delivery": params.deliveryId,
@@ -170,11 +247,9 @@ async function deliver(params: {
           "X-Yak-Signature": `v1=${signature}`,
         },
         body,
-        // A redirect could send the signed payload, or the request itself,
-        // somewhere the URL check never saw. A 3xx is a failed delivery.
-        redirect: "manual",
-        signal: AbortSignal.timeout(10_000),
-      })
+        10_000
+      )
+      const response = { ok: status >= 200 && status < 300, status }
 
       if (response.ok) {
         await markDelivery(params.tenantId, params.deliveryId, {

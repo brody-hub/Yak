@@ -8,10 +8,11 @@ import { db } from "../db/index.js"
 import { type PlanTier, tenants } from "../db/schema.js"
 import { withStaffScope, withTenantScope } from "../db/scope.js"
 import { env } from "../env.js"
-import { ConflictError, NotFoundError } from "../lib/errors.js"
+import { NotFoundError } from "../lib/errors.js"
 import { logger } from "../logger.js"
 import { validate } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
+import { sendAccountExistsEmail } from "../services/email.js"
 import { createPanelUser } from "../services/panel-accounts.js"
 import { type BillingInterval, isCheckoutPlan } from "../services/stripe.js"
 import {
@@ -22,24 +23,29 @@ import {
 
 /**
  * Self-serve sign up: a new owner creates their account, its first app and
- * their own login in one step.
+ * their login in one step.
+ *
+ * The form takes no password. The login is created without one, and the
+ * emailed link is where the owner chooses it. That link is the only way in,
+ * so whoever reads the inbox is the only person who can ever hold the
+ * account's password: someone who signs up with another person's email gains
+ * nothing, because they never learn or set the password.
+ *
+ * The answer is the same whether or not the email already has an account
+ * (that person is told by email instead), so the form cannot be used to find
+ * out who uses Yak.
  *
  * The account starts on Free whatever tier was picked. A paid tier is kept as
- * `pending_plan` and paid for through Stripe Checkout once the owner has
- * confirmed their email and signed in; only Stripe's webhook moves the
- * account onto it. Nobody is signed in here: the confirmation link does that.
+ * `pending_plan` and paid for through Stripe Checkout once the owner is
+ * signed in; only Stripe's webhook moves the account onto it.
  */
 export const signupRouter: Router = Router()
-
-/** An unconfirmed sign up older than this no longer holds on to its email. */
-const ABANDONED_AFTER_MS = 24 * 60 * 60 * 1000
 
 const signupSchema = z
   .object({
     accountName: z.string().trim().min(1).max(120),
     name: z.string().trim().min(1).max(120),
     email: z.string().trim().toLowerCase().email(),
-    password: z.string().min(12).max(128),
     plan: z
       .enum(PLAN_IDS)
       .refine((plan) => plan !== "scale", "Scale is arranged with our team")
@@ -51,15 +57,18 @@ const signupSchema = z
 type SignupBody = z.infer<typeof signupSchema>
 
 /**
- * Frees an email held by a sign up that was never confirmed, so a typo or a
- * stranger cannot keep a real owner out for good. Only ever removes an
- * account its owner created and never got into: nothing can be in it.
+ * Clears the way for a sign up. Returns false when the email already has a
+ * real account, which must be left alone.
+ *
+ * A sign up whose password was never set is replaced: nobody has ever been
+ * able to sign in to it, so nothing can be in it, and holding on to it would
+ * let a typo or a stranger keep the real owner out.
  */
-async function releaseAbandonedSignup(email: string) {
+async function releasePendingSignup(email: string): Promise<boolean> {
   const existing = await findUserByEmail(email)
 
   if (!existing) {
-    return
+    return true
   }
 
   const [tenant] = existing.tenantId
@@ -70,19 +79,14 @@ async function releaseAbandonedSignup(email: string) {
         .limit(1)
     : []
 
-  const abandoned =
+  const pending =
     !existing.emailVerified &&
     existing.role === "owner" &&
     existing.lastLoginAt === null &&
-    tenant?.signupSource === "self_serve" &&
-    Date.now() - existing.createdAt.getTime() > ABANDONED_AFTER_MS
+    tenant?.signupSource === "self_serve"
 
-  if (!abandoned) {
-    throw new ConflictError(
-      existing.emailVerified
-        ? "An account with this email already exists. Sign in instead."
-        : "This email is waiting to be confirmed. Check your inbox for the link, or sign in to get a new one."
-    )
+  if (!pending) {
+    return false
   }
 
   await withStaffScope((staff) =>
@@ -91,8 +95,9 @@ async function releaseAbandonedSignup(email: string) {
 
   logger.info(
     { tenantId: tenant.id },
-    "Removed an unconfirmed sign up to free its email"
+    "Replaced a sign up whose password was never set"
   )
+  return true
 }
 
 signupRouter.post("/", validate({ body: signupSchema }), async (req, res) => {
@@ -107,7 +112,11 @@ signupRouter.post("/", validate({ body: signupSchema }), async (req, res) => {
     ? body.interval
     : null
 
-  await releaseAbandonedSignup(body.email)
+  if (!(await releasePendingSignup(body.email))) {
+    await sendAccountExistsEmail({ to: body.email })
+    res.status(201).json({ data: { email: body.email } })
+    return
+  }
 
   const slug = await availableTenantSlug(body.accountName)
 
@@ -130,7 +139,7 @@ signupRouter.post("/", validate({ body: signupSchema }), async (req, res) => {
       email: body.email,
       name: body.name,
       role: "owner",
-      password: body.password,
+      selfServe: true,
     })
     ownerId = user.id
   } catch (error) {
@@ -155,12 +164,13 @@ signupRouter.post("/", validate({ body: signupSchema }), async (req, res) => {
     })
   )
 
-  // Answers the same whether or not the send worked; the sign in screen
-  // offers a fresh link, and signing in unverified sends one too.
+  // The link to choose a password; sendResetPassword words it as the end of
+  // sign up because the login is unverified. Answers the same whether or not
+  // the send worked; the page offers to send it again.
   await auth.api
-    .sendVerificationEmail({ body: { email: body.email } })
+    .requestPasswordReset({ body: { email: body.email } })
     .catch((error: unknown) => {
-      logger.error({ err: error }, "Could not send the sign up verification email")
+      logger.error({ err: error }, "Could not send the sign up password link")
     })
 
   res.status(201).json({ data: { email: body.email } })
