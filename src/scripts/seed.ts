@@ -1,20 +1,32 @@
-import { count } from "drizzle-orm"
+import { asc, count, eq } from "drizzle-orm"
 
 import { closeDatabase, db } from "../db/index.js"
 import {
   analyticsEvents,
+  apps,
   appUsers,
   reportMessages,
   reports,
   sprints,
+  tenants,
   tickets,
 } from "../db/schema.js"
+import { withTenantScope } from "../db/scope.js"
 import { generatePublicToken, newId } from "../lib/crypto.js"
 import { logger } from "../logger.js"
+import { nextReportNumber, nextTicketNumber } from "../services/tenants.js"
 
 /**
- * Fills a fresh database with representative data so the panel has something
- * to render before a real integration is wired up. Safe to skip in production.
+ * Fills a tenant's first app with representative data so the panel has
+ * something to render before a real integration is wired up. Safe to skip in
+ * production.
+ *
+ *   npm run seed                 seeds the oldest tenant
+ *   npm run seed -- <slug>       seeds the tenant with that slug
+ *
+ * Tenants are created from the admin console, so this never creates one. The
+ * whole run happens inside the tenant's database scope, as a panel request
+ * would, so row level security applies to it like to everything else.
  */
 
 function daysAgo(days: number, hour = 12): Date {
@@ -31,16 +43,86 @@ function addDays(date: Date, days: number): Date {
 }
 
 const APP_USERS = [
-  { name: "Maya Chen", email: "maya@example.com", plan: "pro", billingPeriod: "annual", platform: "ios", status: "active" },
-  { name: "Noah Patel", email: "noah@example.com", plan: "pro", billingPeriod: "monthly", platform: "android", status: "active" },
-  { name: "Sofia Alvarez", email: "sofia@example.com", plan: "plus", billingPeriod: "monthly", platform: "android", status: "trialing" },
-  { name: "Liam Brooks", email: "liam@example.com", plan: "free", billingPeriod: "none", platform: "web", status: "active" },
-  { name: "Ava Nguyen", email: "ava@example.com", plan: "plus", billingPeriod: "annual", platform: "ios", status: "active" },
-  { name: "Ethan Cole", email: "ethan@example.com", plan: "free", billingPeriod: "none", platform: "web", status: "churned" },
-  { name: "Harper Diaz", email: "harper@example.com", plan: "pro", billingPeriod: "monthly", platform: "ios", status: "trialing" },
-  { name: "Owen Kim", email: "owen@example.com", plan: "plus", billingPeriod: "monthly", platform: "web", status: "active" },
-  { name: "Isla Freya", email: "isla@example.com", plan: "free", billingPeriod: "none", platform: "ios", status: "active" },
-  { name: "Jack Morgan", email: "jack@example.com", plan: "pro", billingPeriod: "annual", platform: "android", status: "churned" },
+  {
+    name: "Maya Chen",
+    email: "maya@example.com",
+    plan: "pro",
+    billingPeriod: "annual",
+    platform: "ios",
+    status: "active",
+  },
+  {
+    name: "Noah Patel",
+    email: "noah@example.com",
+    plan: "pro",
+    billingPeriod: "monthly",
+    platform: "android",
+    status: "active",
+  },
+  {
+    name: "Sofia Alvarez",
+    email: "sofia@example.com",
+    plan: "plus",
+    billingPeriod: "monthly",
+    platform: "android",
+    status: "trialing",
+  },
+  {
+    name: "Liam Brooks",
+    email: "liam@example.com",
+    plan: "free",
+    billingPeriod: "none",
+    platform: "web",
+    status: "active",
+  },
+  {
+    name: "Ava Nguyen",
+    email: "ava@example.com",
+    plan: "plus",
+    billingPeriod: "annual",
+    platform: "ios",
+    status: "active",
+  },
+  {
+    name: "Ethan Cole",
+    email: "ethan@example.com",
+    plan: "free",
+    billingPeriod: "none",
+    platform: "web",
+    status: "churned",
+  },
+  {
+    name: "Harper Diaz",
+    email: "harper@example.com",
+    plan: "pro",
+    billingPeriod: "monthly",
+    platform: "ios",
+    status: "trialing",
+  },
+  {
+    name: "Owen Kim",
+    email: "owen@example.com",
+    plan: "plus",
+    billingPeriod: "monthly",
+    platform: "web",
+    status: "active",
+  },
+  {
+    name: "Isla Freya",
+    email: "isla@example.com",
+    plan: "free",
+    billingPeriod: "none",
+    platform: "ios",
+    status: "active",
+  },
+  {
+    name: "Jack Morgan",
+    email: "jack@example.com",
+    plan: "pro",
+    billingPeriod: "annual",
+    platform: "android",
+    status: "churned",
+  },
 ] as const
 
 const REPORTS = [
@@ -102,7 +184,8 @@ const REPORTS = [
     email: "ava@example.com",
     platform: "android",
     ageDays: 2,
-    reply: "Fixed in 2.14.1 - please update and let us know if it still happens.",
+    reply:
+      "Fixed in 2.14.1 - please update and let us know if it still happens.",
   },
   {
     type: "support",
@@ -129,13 +212,57 @@ const REPORTS = [
 ] as const
 
 const TICKETS = [
-  { title: "Polish dashboard KPI cards", description: "Tighten spacing and make trend badges match the primary color system.", status: "in_progress", priority: "high", sprint: 1 },
-  { title: "Add report triage filters", description: "Allow filtering reports by status and severity in the support inbox.", status: "todo", priority: "medium", sprint: 1 },
-  { title: "Ship theme branding upload", description: "Logo upload and app name should persist to the backend.", status: "done", priority: "high", sprint: 0 },
-  { title: "Define sprint capacity view", description: "Show assigned ticket count per system user for the sprint.", status: "backlog", priority: "low", sprint: null },
-  { title: "Improve user activity log", description: "Group activity by day and add filter chips for action type.", status: "todo", priority: "urgent", sprint: 1 },
-  { title: "Notification digests for assignees", description: "Email a daily digest when assigned tickets change status.", status: "backlog", priority: "medium", sprint: null },
-  { title: "Bulk permission editing", description: "Select multiple panel users and apply section permissions.", status: "todo", priority: "high", sprint: null },
+  {
+    title: "Polish dashboard KPI cards",
+    description:
+      "Tighten spacing and make trend badges match the primary color system.",
+    status: "in_progress",
+    priority: "high",
+    sprint: 1,
+  },
+  {
+    title: "Add report triage filters",
+    description:
+      "Allow filtering reports by status and severity in the support inbox.",
+    status: "todo",
+    priority: "medium",
+    sprint: 1,
+  },
+  {
+    title: "Ship theme branding upload",
+    description: "Logo upload and app name should persist to the backend.",
+    status: "done",
+    priority: "high",
+    sprint: 0,
+  },
+  {
+    title: "Define sprint capacity view",
+    description: "Show assigned ticket count per system user for the sprint.",
+    status: "backlog",
+    priority: "low",
+    sprint: null,
+  },
+  {
+    title: "Improve user activity log",
+    description: "Group activity by day and add filter chips for action type.",
+    status: "todo",
+    priority: "urgent",
+    sprint: 1,
+  },
+  {
+    title: "Notification digests for assignees",
+    description: "Email a daily digest when assigned tickets change status.",
+    status: "backlog",
+    priority: "medium",
+    sprint: null,
+  },
+  {
+    title: "Bulk permission editing",
+    description: "Select multiple panel users and apply section permissions.",
+    status: "todo",
+    priority: "high",
+    sprint: null,
+  },
 ] as const
 
 const EVENT_NAMES = [
@@ -164,23 +291,84 @@ function pickEventName(): string {
   return EVENT_NAMES[0].name
 }
 
-async function isEmpty(): Promise<boolean> {
-  const [row] = await db.select({ total: count() }).from(appUsers)
+async function resolveTenant(slug: string | undefined) {
+  const [row] = slug
+    ? await db.select().from(tenants).where(eq(tenants.slug, slug)).limit(1)
+    : await db.select().from(tenants).orderBy(asc(tenants.createdAt)).limit(1)
+
+  if (!row) {
+    throw new Error(
+      slug
+        ? `No tenant with slug "${slug}"`
+        : "No tenants exist yet. Create one from the admin console first."
+    )
+  }
+
+  return row
+}
+
+async function isEmpty(tenantId: string): Promise<boolean> {
+  const [row] = await db
+    .select({ total: count() })
+    .from(appUsers)
+    .where(eq(appUsers.tenantId, tenantId))
   return Number(row?.total ?? 0) === 0
 }
 
+/** The tenant's oldest app, created if the account somehow has none. */
+async function resolveApp(tenant: { id: string; name: string; slug: string }) {
+  const [existing] = await db
+    .select()
+    .from(apps)
+    .where(eq(apps.tenantId, tenant.id))
+    .orderBy(asc(apps.createdAt))
+    .limit(1)
+
+  if (existing) {
+    return existing
+  }
+
+  const [created] = await db
+    .insert(apps)
+    .values({
+      id: newId(),
+      tenantId: tenant.id,
+      name: tenant.name,
+      slug: tenant.slug,
+    })
+    .returning()
+
+  return created!
+}
+
 async function main() {
-  if (!(await isEmpty())) {
-    logger.info("Database already has data - skipping seed")
+  const tenant = await resolveTenant(process.argv[2]?.trim() || undefined)
+
+  await withTenantScope(tenant.id, () => seedTenant(tenant))
+}
+
+async function seedTenant(tenant: { id: string; name: string; slug: string }) {
+  const tenantId = tenant.id
+
+  if (!(await isEmpty(tenantId))) {
+    logger.info(
+      { tenant: tenant.slug },
+      "Tenant already has data - skipping seed"
+    )
     return
   }
 
-  logger.info("Seeding demo data")
+  const app = await resolveApp(tenant)
+  const appId = app.id
+
+  logger.info({ tenant: tenant.slug, app: app.slug }, "Seeding demo data")
 
   /* App users -------------------------------------------------------------- */
 
   const userRows = APP_USERS.map((entry, index) => ({
     id: newId(),
+    tenantId,
+    appId,
     externalId: `u_${1000 + index * 137}`,
     name: entry.name,
     email: entry.email,
@@ -200,6 +388,7 @@ async function main() {
   const sprintRows = [
     {
       id: newId(),
+      tenantId,
       name: "Sprint 12",
       durationWeeks: 2,
       startDate: sprintStart,
@@ -207,6 +396,7 @@ async function main() {
     },
     {
       id: newId(),
+      tenantId,
       name: "Sprint 13",
       durationWeeks: 1,
       startDate: addDays(sprintStart, 14),
@@ -216,43 +406,56 @@ async function main() {
 
   await db.insert(sprints).values(sprintRows)
 
-  await db.insert(tickets).values(
-    TICKETS.map((entry, index) => ({
-      id: newId(),
-      title: entry.title,
-      description: entry.description,
-      status: entry.status,
-      priority: entry.priority,
-      sprintId: entry.sprint === null ? null : sprintRows[entry.sprint]!.id,
-      createdAt: daysAgo(7 - index, 9),
-      updatedAt: daysAgo(Math.max(0, 5 - index), 14),
-    }))
-  )
+  // One at a time so each ticket draws the tenant's next number.
+  for (const [index, entry] of TICKETS.entries()) {
+    await db.transaction(async (tx) => {
+      await tx.insert(tickets).values({
+        id: newId(),
+        tenantId,
+        number: await nextTicketNumber(tx, tenantId),
+        title: entry.title,
+        description: entry.description,
+        status: entry.status,
+        priority: entry.priority,
+        sprintId: entry.sprint === null ? null : sprintRows[entry.sprint]!.id,
+        createdAt: daysAgo(7 - index, 9),
+        updatedAt: daysAgo(Math.max(0, 5 - index), 14),
+      })
+    })
+  }
 
   /* Reports ---------------------------------------------------------------- */
 
   for (const entry of REPORTS) {
     const createdAt = daysAgo(entry.ageDays, 10)
 
-    const [report] = await db
-      .insert(reports)
-      .values({
-        id: newId(),
-        type: entry.type,
-        status: entry.status,
-        priority: entry.priority,
-        subject: entry.subject,
-        body: entry.body,
-        reporterName: entry.reporter,
-        reporterEmail: entry.email,
-        platform: entry.platform,
-        source: "api",
-        publicToken: generatePublicToken(),
-        createdAt,
-        updatedAt: createdAt,
-        resolvedAt: entry.status === "resolved" ? addDays(createdAt, 1) : null,
-      })
-      .returning()
+    const report = await db.transaction(async (tx) => {
+      const [created] = await tx
+        .insert(reports)
+        .values({
+          id: newId(),
+          tenantId,
+          appId,
+          number: await nextReportNumber(tx, tenantId),
+          type: entry.type,
+          status: entry.status,
+          priority: entry.priority,
+          subject: entry.subject,
+          body: entry.body,
+          reporterName: entry.reporter,
+          reporterEmail: entry.email,
+          platform: entry.platform,
+          source: "api",
+          publicToken: generatePublicToken(),
+          createdAt,
+          updatedAt: createdAt,
+          resolvedAt:
+            entry.status === "resolved" ? addDays(createdAt, 1) : null,
+        })
+        .returning()
+
+      return created
+    })
 
     if (!report) {
       continue
@@ -261,6 +464,8 @@ async function main() {
     const messages: (typeof reportMessages.$inferInsert)[] = [
       {
         id: newId(),
+        tenantId,
+        appId,
         reportId: report.id,
         authorType: "user",
         authorName: entry.reporter,
@@ -272,6 +477,8 @@ async function main() {
     if ("reply" in entry && entry.reply) {
       messages.push({
         id: newId(),
+        tenantId,
+        appId,
         reportId: report.id,
         authorType: "agent",
         authorName: "Support",
@@ -299,6 +506,8 @@ async function main() {
 
       events.push({
         id: newId(),
+        tenantId,
+        appId,
         name: pickEventName(),
         externalUserId: actor.externalId,
         userName: actor.name,

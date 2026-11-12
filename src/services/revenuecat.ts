@@ -1,7 +1,8 @@
-import { eq } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 
 import { db } from "../db/index.js"
 import { providerIntegrations } from "../db/schema.js"
+import { withTenantScope } from "../db/scope.js"
 import { decryptSecret } from "../lib/crypto.js"
 import {
   BadRequestError,
@@ -29,6 +30,10 @@ const CHART_FAILURE_TTL_MS = 60_000
 
 type CacheEntry = { expiresAt: number; value: unknown }
 
+/**
+ * Keyed `${tenantId}:${appId}:...` so one app can never be served another's
+ * metrics, even if both pointed at the same RevenueCat project.
+ */
 const cache = new Map<string, CacheEntry>()
 
 function cached<T>(
@@ -48,9 +53,26 @@ function cached<T>(
   })
 }
 
-/** Dropped whenever the stored credential changes so stale data cannot leak. */
-export function clearRevenueCatCache() {
-  cache.clear()
+/**
+ * Dropped whenever the app's stored credential changes so stale data cannot
+ * leak. Other apps' entries are left alone.
+ */
+export function clearRevenueCatCache(tenantId: string, appId: string) {
+  const prefix = `${tenantId}:${appId}:`
+
+  for (const key of cache.keys()) {
+    if (key.startsWith(prefix)) {
+      cache.delete(key)
+    }
+  }
+}
+
+function revenueCatRow(tenantId: string, appId: string) {
+  return and(
+    eq(providerIntegrations.tenantId, tenantId),
+    eq(providerIntegrations.appId, appId),
+    eq(providerIntegrations.provider, "revenuecat")
+  )
 }
 
 /* -------------------------------------------------------------------------- */
@@ -58,6 +80,8 @@ export function clearRevenueCatCache() {
 /* -------------------------------------------------------------------------- */
 
 export type RevenueCatCredential = {
+  tenantId: string
+  appId: string
   apiKey: string
   projectId: string
 }
@@ -66,11 +90,14 @@ export type RevenueCatCredential = {
  * Reads and decrypts the stored key. Returns null when RevenueCat has not been
  * connected, which callers treat as "no data available" rather than an error.
  */
-export async function loadRevenueCatCredential(): Promise<RevenueCatCredential | null> {
+export async function loadRevenueCatCredential(
+  tenantId: string,
+  appId: string
+): Promise<RevenueCatCredential | null> {
   const [row] = await db
     .select()
     .from(providerIntegrations)
-    .where(eq(providerIntegrations.provider, "revenuecat"))
+    .where(revenueCatRow(tenantId, appId))
     .limit(1)
 
   if (!row?.externalId) {
@@ -78,7 +105,15 @@ export async function loadRevenueCatCredential(): Promise<RevenueCatCredential |
   }
 
   try {
-    return { apiKey: decryptSecret(row.apiKeyEncrypted), projectId: row.externalId }
+    return {
+      tenantId,
+      appId,
+      apiKey: decryptSecret(
+        row.apiKeyEncrypted,
+        revenueCatBinding(tenantId, appId)
+      ),
+      projectId: row.externalId,
+    }
   } catch (error) {
     // A rotated ENCRYPTION_KEY makes the ciphertext unreadable. Surface it as
     // disconnected so the operator is prompted to re-enter the key.
@@ -255,7 +290,9 @@ export async function resolveProject(
   return projects[0] as RevenueCatProject
 }
 
-export async function listProjects(apiKey: string): Promise<RevenueCatProject[]> {
+export async function listProjects(
+  apiKey: string
+): Promise<RevenueCatProject[]> {
   const response = await revenueCatRequest<ProjectListResponse>(
     apiKey,
     "/projects",
@@ -308,14 +345,20 @@ export type RevenueCatOverview = {
  * pressed Test. The overview is cached for a minute, so this writes at most
  * once a minute however many tiles are open.
  */
-function recordConnectionCheck(error: string | null): void {
-  void db
-    .update(providerIntegrations)
-    .set({ lastCheckedAt: new Date(), lastError: error })
-    .where(eq(providerIntegrations.provider, "revenuecat"))
-    .catch((cause: unknown) => {
-      logger.warn({ err: cause }, "Could not record the RevenueCat check")
-    })
+function recordConnectionCheck(
+  credential: RevenueCatCredential,
+  error: string | null
+): void {
+  // Fire and forget, so it opens its own scope rather than borrowing the
+  // request's, which may already be released by the time this runs.
+  void withTenantScope(credential.tenantId, async () => {
+    await db
+      .update(providerIntegrations)
+      .set({ lastCheckedAt: new Date(), lastError: error })
+      .where(revenueCatRow(credential.tenantId, credential.appId))
+  }).catch((cause: unknown) => {
+    logger.warn({ err: cause }, "Could not record the RevenueCat check")
+  })
 }
 
 /**
@@ -326,7 +369,9 @@ function recordConnectionCheck(error: string | null): void {
 export async function fetchOverview(
   credential: RevenueCatCredential
 ): Promise<RevenueCatOverview> {
-  return cached(`overview:${credential.projectId}`, OVERVIEW_CACHE_TTL_MS, async () => {
+  const key = `${credential.tenantId}:${credential.appId}:overview:${credential.projectId}`
+
+  return cached(key, OVERVIEW_CACHE_TTL_MS, async () => {
     let response: OverviewResponse
 
     try {
@@ -336,12 +381,13 @@ export async function fetchOverview(
       )
     } catch (error) {
       recordConnectionCheck(
+        credential,
         error instanceof Error ? error.message : "RevenueCat check failed"
       )
       throw error
     }
 
-    recordConnectionCheck(null)
+    recordConnectionCheck(credential, null)
 
     return {
       currency: response.currency ?? "USD",
@@ -489,7 +535,9 @@ function pointValue(raw: unknown): number | null {
  * primary measure, summing duplicates so a segmented response still charts as
  * one line.
  */
-function parseChartPoints(response: ChartResponse): { date: string; value: number }[] {
+function parseChartPoints(
+  response: ChartResponse
+): { date: string; value: number }[] {
   const raw = response.values ?? response.data
 
   if (!Array.isArray(raw)) {
@@ -552,7 +600,7 @@ export async function fetchChart(
 ): Promise<RevenueCatChartResult> {
   const resolution: RevenueCatResolution =
     days > 90 ? "month" : days > 31 ? "week" : "day"
-  const key = `chart:${credential.projectId}:${chart}:${days}`
+  const key = `${credential.tenantId}:${credential.appId}:chart:${credential.projectId}:${chart}:${days}`
   const hit = cache.get(key)
 
   if (hit && hit.expiresAt > Date.now()) {
@@ -563,7 +611,8 @@ export async function fetchChart(
 
   cache.set(key, {
     value: result,
-    expiresAt: Date.now() + (result.ok ? CHART_CACHE_TTL_MS : CHART_FAILURE_TTL_MS),
+    expiresAt:
+      Date.now() + (result.ok ? CHART_CACHE_TTL_MS : CHART_FAILURE_TTL_MS),
   })
 
   return result
@@ -655,4 +704,9 @@ function describeChartError(
     reason: "unavailable",
     message: "RevenueCat did not return this chart.",
   }
+}
+
+/** What a stored RevenueCat key is sealed to; see encryptSecret. */
+export function revenueCatBinding(tenantId: string, appId: string): string {
+  return `${tenantId}:${appId}:revenuecat`
 }

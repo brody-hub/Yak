@@ -1,29 +1,22 @@
-import {
-  and,
-  asc,
-  count,
-  desc,
-  eq,
-  ilike,
-  inArray,
-  or,
-  sql,
-} from "drizzle-orm"
+import { and, asc, count, desc, eq, ilike, inArray, or, sql } from "drizzle-orm"
 import { Router } from "express"
 import { z } from "zod"
 
 import { db } from "../db/index.js"
-import { reportMessages, reports } from "../db/schema.js"
+import { reportMessages, reports, user as userTable } from "../db/schema.js"
 import { newId } from "../lib/crypto.js"
-import { NotFoundError } from "../lib/errors.js"
+import { BadRequestError, NotFoundError } from "../lib/errors.js"
 import { paginated, paginationSchema } from "../lib/pagination.js"
 import { serializeReport } from "../lib/serializers.js"
-import { getAuth } from "../middleware/auth.js"
+import { getAuth, getScope, getTenantId } from "../middleware/auth.js"
 import { validate, validatedQuery } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
 import { dispatchWebhookEvent } from "../services/webhooks.js"
 
-export const reportsRouter: Router = Router()
+/** Mounted under /apps/:appId, so every query here is confined to one app. */
+export const reportsRouter: Router = Router({ mergeParams: true })
+
+type Scope = { tenantId: string; appId: string }
 
 const idParamSchema = z.object({ id: z.string().min(1) })
 const typeSchema = z.enum(["bug", "suggestion", "support", "report"])
@@ -38,11 +31,18 @@ const prioritySchema = z.enum(["urgent", "high", "medium", "low"])
 
 const CLOSED_STATUSES = ["resolved", "closed"] as const
 
-async function loadReport(id: string) {
+function inApp(scope: Scope) {
+  return and(
+    eq(reports.tenantId, scope.tenantId),
+    eq(reports.appId, scope.appId)
+  )
+}
+
+async function loadReport(scope: Scope, id: string) {
   const [row] = await db
     .select()
     .from(reports)
-    .where(eq(reports.id, id))
+    .where(and(eq(reports.id, id), inApp(scope)))
     .limit(1)
 
   if (!row) {
@@ -52,20 +52,37 @@ async function loadReport(id: string) {
   return row
 }
 
-async function loadMessages(reportId: string) {
+async function loadMessages(scope: Scope, reportId: string) {
   return db
     .select()
     .from(reportMessages)
-    .where(eq(reportMessages.reportId, reportId))
+    .where(
+      and(
+        eq(reportMessages.reportId, reportId),
+        eq(reportMessages.tenantId, scope.tenantId),
+        eq(reportMessages.appId, scope.appId)
+      )
+    )
     .orderBy(asc(reportMessages.createdAt))
 }
 
+/** The app the current request is for, named for outbound payloads. */
+function appOrigin(req: Parameters<typeof getScope>[0]) {
+  const app = req.currentApp!
+  return { id: app.id, name: app.name }
+}
+
 /** Open counts per type, used for the inbox badges. */
-reportsRouter.get("/counts", async (_req, res) => {
+reportsRouter.get("/counts", async (req, res) => {
   const rows = await db
     .select({ type: reports.type, total: count() })
     .from(reports)
-    .where(sql`${reports.status} not in ('resolved', 'closed')`)
+    .where(
+      and(
+        inApp(getScope(req)),
+        sql`${reports.status} not in ('resolved', 'closed')`
+      )
+    )
     .groupBy(reports.type)
 
   const counts = { all: 0, bug: 0, suggestion: 0, support: 0, report: 0 }
@@ -105,7 +122,9 @@ reportsRouter.get(
       openOnly?: boolean
     }>(req)
 
+    const scope = getScope(req)
     const conditions = [
+      inApp(scope),
       query.type ? eq(reports.type, query.type) : undefined,
       query.status ? eq(reports.status, query.status) : undefined,
       query.priority ? eq(reports.priority, query.priority) : undefined,
@@ -124,7 +143,7 @@ reportsRouter.get(
         : undefined,
     ].filter(Boolean)
 
-    const where = conditions.length > 0 ? and(...conditions) : undefined
+    const where = and(...conditions)
 
     const rows = await db
       .select()
@@ -145,7 +164,13 @@ reportsRouter.get(
       ? await db
           .select()
           .from(reportMessages)
-          .where(inArray(reportMessages.reportId, ids))
+          .where(
+            and(
+              eq(reportMessages.tenantId, scope.tenantId),
+              eq(reportMessages.appId, scope.appId),
+              inArray(reportMessages.reportId, ids)
+            )
+          )
           .orderBy(asc(reportMessages.createdAt))
       : []
 
@@ -171,8 +196,9 @@ reportsRouter.get(
   "/:id",
   validate({ params: idParamSchema }),
   async (req, res) => {
-    const row = await loadReport(req.params.id as string)
-    const messages = await loadMessages(row.id)
+    const scope = getScope(req)
+    const row = await loadReport(scope, req.params.id as string)
+    const messages = await loadMessages(scope, row.id)
 
     res.json({ data: serializeReport(row, messages) })
   }
@@ -195,11 +221,30 @@ reportsRouter.patch(
   }),
   async (req, res) => {
     const { user } = getAuth(req)
-    const existing = await loadReport(req.params.id as string)
+    const scope = getScope(req)
+    const tenantId = getTenantId(req)
+    const existing = await loadReport(scope, req.params.id as string)
     const body = req.body as {
       status?: z.infer<typeof statusSchema>
       priority?: z.infer<typeof prioritySchema>
       assigneeId?: string | null
+    }
+
+    if (body.assigneeId) {
+      const [assignee] = await db
+        .select({ id: userTable.id })
+        .from(userTable)
+        .where(
+          and(
+            eq(userTable.id, body.assigneeId),
+            eq(userTable.tenantId, tenantId)
+          )
+        )
+        .limit(1)
+
+      if (!assignee) {
+        throw new BadRequestError("That assignee does not exist")
+      }
     }
 
     const becameClosed =
@@ -213,11 +258,15 @@ reportsRouter.patch(
         // Stamp the resolution time on the first transition into a closed
         // state, and clear it if the report is reopened.
         ...(body.status !== undefined
-          ? { resolvedAt: becameClosed ? (existing.resolvedAt ?? new Date()) : null }
+          ? {
+              resolvedAt: becameClosed
+                ? (existing.resolvedAt ?? new Date())
+                : null,
+            }
           : {}),
         updatedAt: new Date(),
       })
-      .where(eq(reports.id, existing.id))
+      .where(and(eq(reports.id, existing.id), inApp(scope)))
       .returning()
 
     if (!row) {
@@ -225,15 +274,21 @@ reportsRouter.patch(
     }
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "updated",
       section: "reports",
       summary: `Updated report #${row.number}`,
-      metadata: { reportId: row.id, fields: Object.keys(body) },
+      metadata: {
+        reportId: row.id,
+        appId: scope.appId,
+        fields: Object.keys(body),
+      },
       ipAddress: req.ip,
     })
 
-    const messages = await loadMessages(row.id)
+    const messages = await loadMessages(scope, row.id)
+    const origin = { app: appOrigin(req) }
     const payload = {
       report: {
         id: row.id,
@@ -245,16 +300,18 @@ reportsRouter.patch(
       },
     }
 
-    void dispatchWebhookEvent("report.updated", payload)
+    void dispatchWebhookEvent(tenantId, "report.updated", payload, origin)
 
     if (body.status && body.status !== existing.status) {
-      void dispatchWebhookEvent("report.status_changed", {
-        ...payload,
-        previousStatus: existing.status,
-      })
+      void dispatchWebhookEvent(
+        tenantId,
+        "report.status_changed",
+        { ...payload, previousStatus: existing.status },
+        origin
+      )
 
       if (becameClosed) {
-        void dispatchWebhookEvent("report.resolved", payload)
+        void dispatchWebhookEvent(tenantId, "report.resolved", payload, origin)
       }
     }
 
@@ -278,7 +335,9 @@ reportsRouter.post(
   }),
   async (req, res) => {
     const { user } = getAuth(req)
-    const existing = await loadReport(req.params.id as string)
+    const scope = getScope(req)
+    const tenantId = getTenantId(req)
+    const existing = await loadReport(scope, req.params.id as string)
     const body = req.body as {
       body: string
       isInternal: boolean
@@ -288,6 +347,8 @@ reportsRouter.post(
     const row = await db.transaction(async (tx) => {
       await tx.insert(reportMessages).values({
         id: newId(),
+        tenantId,
+        appId: scope.appId,
         reportId: existing.id,
         authorType: "agent",
         authorName: user.name,
@@ -302,7 +363,7 @@ reportsRouter.post(
           ...(body.status ? { status: body.status } : {}),
           updatedAt: new Date(),
         })
-        .where(eq(reports.id, existing.id))
+        .where(and(eq(reports.id, existing.id), inApp(scope)))
         .returning()
 
       return updated
@@ -313,22 +374,32 @@ reportsRouter.post(
     }
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "updated",
       section: "reports",
       summary: `Replied to report #${row.number}`,
-      metadata: { reportId: row.id, internal: body.isInternal },
+      metadata: {
+        reportId: row.id,
+        appId: scope.appId,
+        internal: body.isInternal,
+      },
       ipAddress: req.ip,
     })
 
     if (!body.isInternal) {
-      void dispatchWebhookEvent("report.replied", {
-        report: { id: row.id, number: row.number, status: row.status },
-        message: { author: "agent", authorName: user.name, body: body.body },
-      })
+      void dispatchWebhookEvent(
+        tenantId,
+        "report.replied",
+        {
+          report: { id: row.id, number: row.number, status: row.status },
+          message: { author: "agent", authorName: user.name, body: body.body },
+        },
+        { app: appOrigin(req) }
+      )
     }
 
-    const messages = await loadMessages(row.id)
+    const messages = await loadMessages(scope, row.id)
 
     res.status(201).json({ data: serializeReport(row, messages) })
   }

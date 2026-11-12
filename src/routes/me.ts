@@ -10,9 +10,10 @@ import { appendAuthCookies } from "../lib/auth-cookies.js"
 import { BadRequestError, NotFoundError } from "../lib/errors.js"
 import { serializeActivity, serializeCurrentUser } from "../lib/serializers.js"
 import { getAuth } from "../middleware/auth.js"
+import { passwordChangeLimiter } from "../middleware/rate-limit.js"
 import { validate } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
-import { imageExists, isManagedObjectKey } from "../services/r2.js"
+import { imageExists, isTenantObjectKey } from "../services/r2.js"
 
 export const meRouter: Router = Router()
 
@@ -34,15 +35,13 @@ meRouter.get("/", async (req, res) => {
   const { user } = getAuth(req)
   const row = await loadCurrentUser(user.id)
 
-  res.json({ data: serializeCurrentUser(row) })
+  res.json({ data: serializeCurrentUser(row, getAuth(req).tenant) })
 })
 
 meRouter.patch(
   "/",
   validate({
-    body: z
-      .object({ name: z.string().trim().min(1).max(120) })
-      .strict(),
+    body: z.object({ name: z.string().trim().min(1).max(120) }).strict(),
   }),
   async (req, res) => {
     const { user } = getAuth(req)
@@ -59,6 +58,7 @@ meRouter.patch(
     }
 
     await recordActivity({
+      tenantId: user.tenantId,
       userId: user.id,
       action: "updated",
       section: "account",
@@ -66,7 +66,7 @@ meRouter.patch(
       ipAddress: req.ip,
     })
 
-    res.json({ data: serializeCurrentUser(row) })
+    res.json({ data: serializeCurrentUser(row, getAuth(req).tenant) })
   }
 )
 
@@ -76,6 +76,7 @@ meRouter.patch(
  */
 meRouter.post(
   "/password",
+  passwordChangeLimiter,
   validate({
     body: z
       .object({
@@ -119,6 +120,7 @@ meRouter.post(
       .returning()
 
     await recordActivity({
+      tenantId: user.tenantId,
       userId: user.id,
       action: "updated",
       section: "account",
@@ -126,7 +128,9 @@ meRouter.post(
       ipAddress: req.ip,
     })
 
-    res.json({ data: row ? serializeCurrentUser(row) : null })
+    res.json({
+      data: row ? serializeCurrentUser(row, getAuth(req).tenant) : null,
+    })
   }
 )
 
@@ -145,7 +149,13 @@ meRouter.put(
     body: z
       .object({
         imageId: z.string().trim().min(1).max(255).nullable().optional(),
-        dataUrl: z.string().trim().min(1).max(INLINE_AVATAR_MAX_CHARS).nullable().optional(),
+        dataUrl: z
+          .string()
+          .trim()
+          .min(1)
+          .max(INLINE_AVATAR_MAX_CHARS)
+          .nullable()
+          .optional(),
       })
       .strict()
       .refine(
@@ -190,9 +200,16 @@ meRouter.put(
       }
     } else {
       const imageId = body.imageId ?? null
+      const current = await loadCurrentUser(user.id)
 
-      if (imageId) {
-        if (!isManagedObjectKey(imageId)) {
+      // An avatar must be this user's own upload in their tenant's prefix.
+      // Re-sending the stored one is allowed, which keeps avatars uploaded
+      // before the multi-tenant key layout working.
+      if (imageId && imageId !== current.avatarImageId) {
+        if (
+          !user.tenantId ||
+          !isTenantObjectKey(imageId, user.tenantId, "avatar", user.id)
+        ) {
           throw new BadRequestError("Invalid image reference")
         }
 
@@ -219,6 +236,7 @@ meRouter.put(
     }
 
     await recordActivity({
+      tenantId: user.tenantId,
       userId: user.id,
       action: "updated",
       section: "account",
@@ -226,7 +244,7 @@ meRouter.put(
       ipAddress: req.ip,
     })
 
-    res.json({ data: serializeCurrentUser(row) })
+    res.json({ data: serializeCurrentUser(row, getAuth(req).tenant) })
   }
 )
 

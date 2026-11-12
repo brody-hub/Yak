@@ -6,13 +6,18 @@ import { analyticsEvents } from "../../db/schema.js"
 import { newId } from "../../lib/crypto.js"
 import { BadRequestError } from "../../lib/errors.js"
 import { getApiKey, requireApiKey } from "../../middleware/api-key.js"
+import { getScope } from "../../middleware/auth.js"
 import { eventIngestLimiter } from "../../middleware/rate-limit.js"
 import { validate } from "../../middleware/validate.js"
 
 export const publicEventsRouter: Router = Router()
 
 /** Property values stay scalar so the analytics table remains queryable. */
-const propertyValueSchema = z.union([z.string().max(500), z.number(), z.boolean()])
+const propertyValueSchema = z.union([
+  z.string().max(500),
+  z.number(),
+  z.boolean(),
+])
 
 const eventSchema = z.object({
   name: z
@@ -81,9 +86,9 @@ publicEventsRouter.post(
   }),
   async (req, res) => {
     const apiKey = getApiKey(req)
+    const { tenantId, appId } = getScope(req)
     const payload = req.body as
-      | z.infer<typeof eventSchema>
-      | { events: z.infer<typeof eventSchema>[] }
+      z.infer<typeof eventSchema> | { events: z.infer<typeof eventSchema>[] }
 
     const events = "events" in payload ? payload.events : [payload]
 
@@ -103,6 +108,8 @@ publicEventsRouter.post(
 
       return {
         id: newId(),
+        tenantId,
+        appId,
         name: event.name,
         externalUserId: event.userId ?? null,
         userName: event.userName ?? null,

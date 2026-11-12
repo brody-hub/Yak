@@ -40,8 +40,22 @@ export const PANEL_PERMISSION_GROUPS: Record<
   discord: { label: "Discord", group: "Settings" },
 }
 
+/** Roles inside a customer's workspace. */
 export const USER_ROLES = ["owner", "admin", "member"] as const
 export type UserRole = (typeof USER_ROLES)[number]
+
+/**
+ * Yak staff. Not one of USER_ROLES: a super admin belongs to no tenant, is
+ * never listed in a customer's roster, and can only reach /api/admin.
+ */
+export const SUPER_ADMIN_ROLE = "super_admin" as const
+export type AccountRole = UserRole | typeof SUPER_ADMIN_ROLE
+
+export function isSuperAdminRole(
+  value: string
+): value is typeof SUPER_ADMIN_ROLE {
+  return value === SUPER_ADMIN_ROLE
+}
 
 export const ROLE_LABELS: Record<UserRole, string> = {
   owner: "Owner",
@@ -58,7 +72,7 @@ export const ROLE_DESCRIPTIONS: Record<UserRole, string> = {
 }
 
 /** Roles that may administer other panel users and mint API keys. */
-const USER_MANAGING_ROLES: readonly UserRole[] = ["owner", "admin"]
+const USER_MANAGING_ROLES: readonly AccountRole[] = ["owner", "admin"]
 
 export function isValidPermission(value: string): value is PanelPermissionId {
   return (PANEL_PERMISSIONS as readonly string[]).includes(value)
@@ -70,14 +84,21 @@ export function isValidRole(value: string): value is UserRole {
 
 export type Principal = {
   id: string
-  role: UserRole
+  role: AccountRole
   permissions: string[]
 }
 
-/** Owners and admins hold every section permission implicitly. */
+/**
+ * Owners and admins hold every section permission implicitly. A super admin
+ * holds none: their access is the admin API, not a customer's panel.
+ */
 export function effectivePermissions(
   principal: Pick<Principal, "role" | "permissions">
 ): PanelPermissionId[] {
+  if (isSuperAdminRole(principal.role)) {
+    return []
+  }
+
   if (USER_MANAGING_ROLES.includes(principal.role)) {
     return [...PANEL_PERMISSIONS]
   }
@@ -92,9 +113,7 @@ export function hasPermission(
   return effectivePermissions(principal).includes(permission)
 }
 
-export function canManageUsers(
-  principal: Pick<Principal, "role">
-): boolean {
+export function canManageUsers(principal: Pick<Principal, "role">): boolean {
   return USER_MANAGING_ROLES.includes(principal.role)
 }
 
@@ -105,8 +124,9 @@ export function canMintApiKeys(principal: Pick<Principal, "role">): boolean {
 /**
  * Whether `actor` is allowed to modify `target`.
  *
- * Rules that keep an instance from being taken over:
- *  - only owners may modify another owner
+ * Rules that keep an account from being taken over:
+ *  - only owners may modify another owner or another admin, so one
+ *    compromised admin cannot lock the rest of the team out
  *  - only owners may grant or revoke the owner role
  *  - nobody may change their own role or deactivate themselves
  */
@@ -120,6 +140,14 @@ export function canManageTargetUser(
 
   if (target.role === "owner" && actor.role !== "owner") {
     return { allowed: false, reason: "Only an owner can modify another owner" }
+  }
+
+  if (
+    target.role === "admin" &&
+    actor.role !== "owner" &&
+    target.id !== actor.id
+  ) {
+    return { allowed: false, reason: "Only an owner can modify another admin" }
   }
 
   return { allowed: true }

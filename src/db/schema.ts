@@ -1,15 +1,21 @@
+import { sql } from "drizzle-orm"
 import {
+  type AnyPgColumn,
   bigint,
   boolean,
+  check,
   date,
+  foreignKey,
   index,
   integer,
   jsonb,
   pgEnum,
+  pgPolicy,
   pgTable,
   primaryKey,
   text,
   timestamp,
+  unique,
   uniqueIndex,
 } from "drizzle-orm/pg-core"
 
@@ -17,7 +23,30 @@ import {
 /* Enums                                                                       */
 /* -------------------------------------------------------------------------- */
 
-export const userRoleEnum = pgEnum("user_role", ["owner", "admin", "member"])
+/**
+ * `super_admin` belongs to Yak staff, not to a customer. A super admin has no
+ * tenant and can only reach the account management API under /api/admin.
+ */
+export const userRoleEnum = pgEnum("user_role", [
+  "owner",
+  "admin",
+  "member",
+  "super_admin",
+])
+
+export const tenantStatusEnum = pgEnum("tenant_status", ["active", "suspended"])
+
+/** Pricing tiers, placed by monthly active users. See src/billing/plans.ts. */
+export const planTierEnum = pgEnum("plan_tier", [
+  "free",
+  "starter",
+  "growth",
+  "pro",
+  "studio",
+  "scale",
+])
+
+export const appStatusEnum = pgEnum("app_status", ["active", "archived"])
 
 export const activityActionEnum = pgEnum("activity_action", [
   "signed_in",
@@ -124,6 +153,154 @@ export const sideshiftConnectionStatusEnum = pgEnum(
 )
 
 /* -------------------------------------------------------------------------- */
+/* Tenants: one row per customer account                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A customer account. Every customer-owned row carries `tenant_id`, every
+ * query against those tables filters on it, and row level security (below)
+ * makes Postgres enforce the same thing.
+ *
+ * `slug` is fixed once created: it prefixes the customer's R2 object keys.
+ */
+const CURRENT_TENANT = sql`nullif(current_setting('app.tenant_id', true), '')`
+const STAFF_SCOPE = sql`nullif(current_setting('app.staff', true), '') = 'true'`
+const LOOKUP_SCOPE = sql`nullif(current_setting('app.lookup', true), '') = 'true'`
+
+export const tenants = pgTable(
+  "tenants",
+  {
+    id: text("id").primaryKey(),
+    name: text("name").notNull(),
+    slug: text("slug").notNull().unique(),
+    status: tenantStatusEnum("status").notNull().default("active"),
+    /**
+     * The account's tier. Set by hand from the admin console until Stripe is
+     * wired up, after which Stripe's subscription state drives it.
+     */
+    plan: planTierEnum("plan").notNull().default("free"),
+    stripeCustomerId: text("stripe_customer_id").unique(),
+    /** Last ticket number handed out; the next ticket gets this plus one. */
+    ticketSeq: integer("ticket_seq").notNull().default(100),
+    /** Last report number handed out; the next report gets this plus one. */
+    reportSeq: integer("report_seq").notNull().default(1000),
+    suspendedAt: timestamp("suspended_at", { withTimezone: true }),
+    suspendedReason: text("suspended_reason"),
+    createdByUserId: text("created_by_user_id"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    // Session resolution reads the signed-in user's tenant before any scope
+    // exists, and the row holds no end user data, so reads are open. Writes
+    // are not: a tenant may update only its own row (counters), staff any.
+    pgPolicy("tenants_read", { for: "select", using: sql`true` }),
+    pgPolicy("tenants_tenant_update", {
+      for: "update",
+      using: sql`${table.id} = ${CURRENT_TENANT}`,
+      withCheck: sql`${table.id} = ${CURRENT_TENANT}`,
+    }),
+    pgPolicy("tenants_staff_write", {
+      for: "all",
+      using: STAFF_SCOPE,
+      withCheck: STAFF_SCOPE,
+    }),
+  ]
+)
+
+/** Customer-owned rows disappear with their tenant. */
+const tenantId = () =>
+  text("tenant_id")
+    .notNull()
+    .references(() => tenants.id, { onDelete: "cascade" })
+
+/* -------------------------------------------------------------------------- */
+/* Row level security                                                          */
+/*                                                                             */
+/* Policies read the session settings that src/db/scope.ts sets on a           */
+/* connection. With none set, `nullif(..., '')` is null and no row matches,    */
+/* so an unscoped query sees nothing. The migrations also FORCE row security   */
+/* so the policies bind the table owner too; drizzle-kit does not model that.  */
+/* -------------------------------------------------------------------------- */
+
+/** Rows are visible and writable only on a connection bound to their tenant. */
+const tenantIsolation = (table: string, column: AnyPgColumn) =>
+  pgPolicy(`${table}_tenant_isolation`, {
+    for: "all",
+    using: sql`${column} = ${CURRENT_TENANT}`,
+    withCheck: sql`${column} = ${CURRENT_TENANT}`,
+  })
+
+/**
+ * Super admins setting up and managing accounts. Granted only on the handful
+ * of tables that holds account metadata; never on end user data.
+ */
+const staffAccess = (table: string) =>
+  pgPolicy(`${table}_staff_access`, {
+    for: "all",
+    using: STAFF_SCOPE,
+    withCheck: STAFF_SCOPE,
+  })
+
+/** A credential being resolved by hash before its tenant is known. */
+const lookupAccess = (table: string) =>
+  pgPolicy(`${table}_lookup_access`, { for: "select", using: LOOKUP_SCOPE })
+
+/* -------------------------------------------------------------------------- */
+/* Apps: the products a customer connects                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One of a customer's apps. Everything an app sends (events, end users,
+ * reports) and the credentials it sends with (API keys, RevenueCat) belong to
+ * exactly one app. The team's own things (tasks, branding, Discord, webhooks,
+ * Sideshift) belong to the account.
+ *
+ * Billing adds MAU across all of an account's apps, so pricing is per account.
+ */
+export const apps = pgTable(
+  "apps",
+  {
+    id: text("id").primaryKey(),
+    tenantId: tenantId(),
+    name: text("name").notNull(),
+    slug: text("slug").notNull(),
+    status: appStatusEnum("status").notNull().default("active"),
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
+    createdByUserId: text("created_by_user_id"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("apps_tenant_id_slug_idx").on(table.tenantId, table.slug),
+    // Lets app-scoped tables reference (tenant_id, app_id) as a pair, so a
+    // row can never point at another tenant's app.
+    unique("apps_tenant_id_id_unique").on(table.tenantId, table.id),
+    tenantIsolation("apps", table.tenantId),
+    staffAccess("apps"),
+    // An API key's app status is read in the same lookup as the key.
+    lookupAccess("apps"),
+  ]
+)
+
+const appId = () => text("app_id").notNull()
+
+/** The composite reference every app-scoped table carries. */
+const appReference = (table: { tenantId: AnyPgColumn; appId: AnyPgColumn }) =>
+  foreignKey({
+    columns: [table.tenantId, table.appId],
+    foreignColumns: [apps.tenantId, apps.id],
+  }).onDelete("cascade")
+
+/* -------------------------------------------------------------------------- */
 /* Better Auth core tables                                                     */
 /*                                                                             */
 /* Column names follow the Better Auth drizzle adapter contract. Extra columns */
@@ -140,12 +317,19 @@ export const user = pgTable(
     emailVerified: boolean("email_verified").notNull().default(false),
     image: text("image"),
 
+    // Null only for super admins, who belong to Yak rather than a customer.
+    tenantId: text("tenant_id").references(() => tenants.id, {
+      onDelete: "cascade",
+    }),
+
     // Authorization
     role: userRoleEnum("role").notNull().default("member"),
     permissions: jsonb("permissions").$type<string[]>().notNull().default([]),
 
     // Invite / credential lifecycle
-    mustChangePassword: boolean("must_change_password").notNull().default(false),
+    mustChangePassword: boolean("must_change_password")
+      .notNull()
+      .default(false),
     invitedByUserId: text("invited_by_user_id"),
     invitedAt: timestamp("invited_at", { withTimezone: true }),
     lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
@@ -165,7 +349,16 @@ export const user = pgTable(
       .notNull()
       .defaultNow(),
   },
-  (table) => [index("user_role_idx").on(table.role)]
+  (table) => [
+    index("user_role_idx").on(table.role),
+    index("user_tenant_id_idx").on(table.tenantId),
+    // Compared as text so the migration that adds `super_admin` to the enum
+    // can also add this check in the same transaction.
+    check(
+      "user_tenant_matches_role",
+      sql`(${table.role}::text = 'super_admin') = (${table.tenantId} is null)`
+    ),
+  ]
 )
 
 export const session = pgTable(
@@ -245,6 +438,10 @@ export const activityLog = pgTable(
   "activity_log",
   {
     id: text("id").primaryKey(),
+    // Null for super admin actions, which belong to no customer.
+    tenantId: text("tenant_id").references(() => tenants.id, {
+      onDelete: "cascade",
+    }),
     userId: text("user_id")
       .notNull()
       .references(() => user.id, { onDelete: "cascade" }),
@@ -263,6 +460,12 @@ export const activityLog = pgTable(
       table.createdAt
     ),
     index("activity_log_created_at_idx").on(table.createdAt),
+    index("activity_log_tenant_id_created_at_idx").on(
+      table.tenantId,
+      table.createdAt
+    ),
+    tenantIsolation("activity_log", table.tenantId),
+    staffAccess("activity_log"),
   ]
 )
 
@@ -270,28 +473,36 @@ export const activityLog = pgTable(
 /* Tasks: sprints, tickets, ticket history                                     */
 /* -------------------------------------------------------------------------- */
 
-export const sprints = pgTable("sprints", {
-  id: text("id").primaryKey(),
-  name: text("name").notNull(),
-  durationWeeks: integer("duration_weeks").notNull(),
-  startDate: timestamp("start_date", { withTimezone: true }).notNull(),
-  endDate: timestamp("end_date", { withTimezone: true }).notNull(),
-  createdAt: timestamp("created_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-})
+export const sprints = pgTable(
+  "sprints",
+  {
+    id: text("id").primaryKey(),
+    tenantId: tenantId(),
+    name: text("name").notNull(),
+    durationWeeks: integer("duration_weeks").notNull(),
+    startDate: timestamp("start_date", { withTimezone: true }).notNull(),
+    endDate: timestamp("end_date", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("sprints_tenant_id_idx").on(table.tenantId),
+    tenantIsolation("sprints", table.tenantId),
+  ]
+)
 
 export const tickets = pgTable(
   "tickets",
   {
     id: text("id").primaryKey(),
-    // Human facing identifier rendered as STAND-101 in the panel.
-    number: integer("number")
-      .notNull()
-      .generatedAlwaysAsIdentity({ startWith: 101 }),
+    tenantId: tenantId(),
+    // Human facing identifier rendered as STAND-101 in the panel. Numbered per
+    // tenant from `tenants.ticket_seq`.
+    number: integer("number").notNull(),
     title: text("title").notNull(),
     description: text("description").notNull().default(""),
     status: ticketStatusEnum("status").notNull().default("backlog"),
@@ -315,10 +526,14 @@ export const tickets = pgTable(
       .defaultNow(),
   },
   (table) => [
-    uniqueIndex("tickets_number_idx").on(table.number),
+    uniqueIndex("tickets_tenant_id_number_idx").on(
+      table.tenantId,
+      table.number
+    ),
     index("tickets_sprint_id_idx").on(table.sprintId),
     index("tickets_assignee_id_idx").on(table.assigneeId),
     index("tickets_status_idx").on(table.status),
+    tenantIsolation("tickets", table.tenantId),
   ]
 )
 
@@ -326,6 +541,7 @@ export const ticketHistory = pgTable(
   "ticket_history",
   {
     id: text("id").primaryKey(),
+    tenantId: tenantId(),
     ticketId: text("ticket_id")
       .notNull()
       .references(() => tickets.id, { onDelete: "cascade" }),
@@ -345,6 +561,11 @@ export const ticketHistory = pgTable(
       table.ticketId,
       table.createdAt
     ),
+    index("ticket_history_tenant_id_created_at_idx").on(
+      table.tenantId,
+      table.createdAt
+    ),
+    tenantIsolation("ticket_history", table.tenantId),
   ]
 )
 
@@ -356,9 +577,11 @@ export const reports = pgTable(
   "reports",
   {
     id: text("id").primaryKey(),
-    number: integer("number")
-      .notNull()
-      .generatedAlwaysAsIdentity({ startWith: 1001 }),
+    tenantId: tenantId(),
+    appId: appId(),
+    // Numbered per tenant from `tenants.report_seq`, so numbers stay unique
+    // across an account's apps.
+    number: integer("number").notNull(),
     type: reportTypeEnum("type").notNull(),
     status: reportStatusEnum("status").notNull().default("open"),
     priority: reportPriorityEnum("priority").notNull().default("medium"),
@@ -396,14 +619,28 @@ export const reports = pgTable(
       .defaultNow(),
   },
   (table) => [
-    uniqueIndex("reports_number_idx").on(table.number),
+    uniqueIndex("reports_tenant_id_number_idx").on(
+      table.tenantId,
+      table.number
+    ),
     uniqueIndex("reports_public_token_idx").on(table.publicToken),
-    index("reports_type_status_idx").on(table.type, table.status),
+    index("reports_app_type_status_idx").on(
+      table.tenantId,
+      table.appId,
+      table.type,
+      table.status
+    ),
     index("reports_assignee_id_idx").on(table.assigneeId),
     index("reports_reporter_email_idx").on(table.reporterEmail),
     index("reports_updated_at_idx").on(table.updatedAt),
     index("reports_external_user_id_idx").on(table.externalUserId),
-    uniqueIndex("reports_idempotency_key_idx").on(table.idempotencyKey),
+    uniqueIndex("reports_app_idempotency_key_idx").on(
+      table.tenantId,
+      table.appId,
+      table.idempotencyKey
+    ),
+    appReference(table),
+    tenantIsolation("reports", table.tenantId),
   ]
 )
 
@@ -411,6 +648,8 @@ export const reportMessages = pgTable(
   "report_messages",
   {
     id: text("id").primaryKey(),
+    tenantId: tenantId(),
+    appId: appId(),
     reportId: text("report_id")
       .notNull()
       .references(() => reports.id, { onDelete: "cascade" }),
@@ -432,6 +671,8 @@ export const reportMessages = pgTable(
       table.reportId,
       table.createdAt
     ),
+    appReference(table),
+    tenantIsolation("report_messages", table.tenantId),
   ]
 )
 
@@ -443,6 +684,8 @@ export const analyticsEvents = pgTable(
   "analytics_events",
   {
     id: text("id").primaryKey(),
+    tenantId: tenantId(),
+    appId: appId(),
     name: text("name").notNull(),
     externalUserId: text("external_user_id"),
     userName: text("user_name"),
@@ -463,12 +706,24 @@ export const analyticsEvents = pgTable(
       .defaultNow(),
   },
   (table) => [
-    index("analytics_events_occurred_at_idx").on(table.occurredAt),
-    index("analytics_events_name_occurred_at_idx").on(
+    index("analytics_events_app_occurred_at_idx").on(
+      table.tenantId,
+      table.appId,
+      table.occurredAt
+    ),
+    index("analytics_events_app_name_occurred_at_idx").on(
+      table.tenantId,
+      table.appId,
       table.name,
       table.occurredAt
     ),
-    index("analytics_events_external_user_id_idx").on(table.externalUserId),
+    index("analytics_events_app_external_user_id_idx").on(
+      table.tenantId,
+      table.appId,
+      table.externalUserId
+    ),
+    appReference(table),
+    tenantIsolation("analytics_events", table.tenantId),
   ]
 )
 
@@ -480,6 +735,8 @@ export const appUsers = pgTable(
   "app_users",
   {
     id: text("id").primaryKey(),
+    tenantId: tenantId(),
+    appId: appId(),
     externalId: text("external_id").notNull(),
     name: text("name").notNull(),
     // Null for accounts with no address on file (phone sign-in).
@@ -503,9 +760,19 @@ export const appUsers = pgTable(
       .defaultNow(),
   },
   (table) => [
-    uniqueIndex("app_users_external_id_idx").on(table.externalId),
-    index("app_users_email_idx").on(table.email),
-    index("app_users_name_idx").on(table.name),
+    uniqueIndex("app_users_app_external_id_idx").on(
+      table.tenantId,
+      table.appId,
+      table.externalId
+    ),
+    index("app_users_app_email_idx").on(
+      table.tenantId,
+      table.appId,
+      table.email
+    ),
+    index("app_users_app_name_idx").on(table.tenantId, table.appId, table.name),
+    appReference(table),
+    tenantIsolation("app_users", table.tenantId),
   ]
 )
 
@@ -517,6 +784,9 @@ export const apiKeys = pgTable(
   "api_keys",
   {
     id: text("id").primaryKey(),
+    tenantId: tenantId(),
+    /** The app this key sends data for. A key never spans apps. */
+    appId: appId(),
     name: text("name").notNull(),
     /** Non secret display prefix, e.g. `yak_live_9f3a2c`. */
     prefix: text("prefix").notNull(),
@@ -540,6 +810,11 @@ export const apiKeys = pgTable(
   (table) => [
     uniqueIndex("api_keys_key_hash_idx").on(table.keyHash),
     index("api_keys_prefix_idx").on(table.prefix),
+    index("api_keys_app_idx").on(table.tenantId, table.appId),
+    appReference(table),
+    tenantIsolation("api_keys", table.tenantId),
+    // Resolving a presented key by hash happens before its tenant is known.
+    lookupAccess("api_keys"),
   ]
 )
 
@@ -547,42 +822,60 @@ export const apiKeys = pgTable(
 /* Settings: branding/theme, Discord, outbound webhooks                        */
 /* -------------------------------------------------------------------------- */
 
-/** Single row keyed by `default`. One deployed instance serves one app. */
-export const appSettings = pgTable("app_settings", {
-  id: text("id").primaryKey().default("default"),
-  brandName: text("brand_name").notNull().default("Stand"),
-  logoImageId: text("logo_image_id"),
-  primaryColor: text("primary_color").notNull().default("#339af0"),
-  defaultTheme: text("default_theme").notNull().default("system"),
-  updatedByUserId: text("updated_by_user_id").references(() => user.id, {
-    onDelete: "set null",
-  }),
-  updatedAt: timestamp("updated_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-})
+/** One row per tenant. Staff create it with the account, hence their access. */
+export const appSettings = pgTable(
+  "app_settings",
+  {
+    tenantId: text("tenant_id")
+      .primaryKey()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    brandName: text("brand_name").notNull().default("Stand"),
+    logoImageId: text("logo_image_id"),
+    primaryColor: text("primary_color").notNull().default("#339af0"),
+    defaultTheme: text("default_theme").notNull().default("system"),
+    updatedByUserId: text("updated_by_user_id").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    tenantIsolation("app_settings", table.tenantId),
+    staffAccess("app_settings"),
+  ]
+)
 
-export const discordTriggers = pgTable("discord_triggers", {
-  trigger: discordTriggerEnum("trigger").primaryKey(),
-  enabled: boolean("enabled").notNull().default(false),
-  /** AES-256-GCM ciphertext. Never returned to the client in plaintext. */
-  webhookUrlEncrypted: text("webhook_url_encrypted"),
-  /** Non secret hint shown in the UI, e.g. `discord.com/api/webhooks/…4821`. */
-  webhookUrlHint: text("webhook_url_hint"),
-  lastFiredAt: timestamp("last_fired_at", { withTimezone: true }),
-  lastError: text("last_error"),
-  updatedByUserId: text("updated_by_user_id").references(() => user.id, {
-    onDelete: "set null",
-  }),
-  updatedAt: timestamp("updated_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-})
+export const discordTriggers = pgTable(
+  "discord_triggers",
+  {
+    tenantId: tenantId(),
+    trigger: discordTriggerEnum("trigger").notNull(),
+    enabled: boolean("enabled").notNull().default(false),
+    /** AES-256-GCM ciphertext. Never returned to the client in plaintext. */
+    webhookUrlEncrypted: text("webhook_url_encrypted"),
+    /** Non secret hint shown in the UI, e.g. `discord.com/api/webhooks/…4821`. */
+    webhookUrlHint: text("webhook_url_hint"),
+    lastFiredAt: timestamp("last_fired_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    updatedByUserId: text("updated_by_user_id").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.tenantId, table.trigger] }),
+    tenantIsolation("discord_triggers", table.tenantId),
+  ]
+)
 
 export const webhookEndpoints = pgTable(
   "webhook_endpoints",
   {
     id: text("id").primaryKey(),
+    tenantId: tenantId(),
     url: text("url").notNull(),
     /** AES-256-GCM ciphertext of the HMAC signing secret. */
     secretEncrypted: text("secret_encrypted").notNull(),
@@ -599,13 +892,20 @@ export const webhookEndpoints = pgTable(
       .notNull()
       .defaultNow(),
   },
-  (table) => [index("webhook_endpoints_enabled_idx").on(table.enabled)]
+  (table) => [
+    index("webhook_endpoints_tenant_id_enabled_idx").on(
+      table.tenantId,
+      table.enabled
+    ),
+    tenantIsolation("webhook_endpoints", table.tenantId),
+  ]
 )
 
 export const webhookDeliveries = pgTable(
   "webhook_deliveries",
   {
     id: text("id").primaryKey(),
+    tenantId: tenantId(),
     endpointId: text("endpoint_id")
       .notNull()
       .references(() => webhookEndpoints.id, { onDelete: "cascade" }),
@@ -625,6 +925,7 @@ export const webhookDeliveries = pgTable(
       table.endpointId,
       table.createdAt
     ),
+    tenantIsolation("webhook_deliveries", table.tenantId),
   ]
 )
 
@@ -633,31 +934,41 @@ export const webhookDeliveries = pgTable(
 /* -------------------------------------------------------------------------- */
 
 /**
- * One row per connected provider. The credential is write-only: it is stored as
- * AES-256-GCM ciphertext and only ever decrypted server side to call the
- * provider's API, so the panel can display connection state without ever
+ * One row per connected provider per app. The credential is write-only: it is
+ * stored as AES-256-GCM ciphertext and only ever decrypted server side to call
+ * the provider's API, so the panel can display connection state without ever
  * handing the key back to a browser.
  */
-export const providerIntegrations = pgTable("provider_integrations", {
-  provider: integrationProviderEnum("provider").primaryKey(),
-  apiKeyEncrypted: text("api_key_encrypted").notNull(),
-  /** Non secret fragment shown in the UI, e.g. `sk_ab…9f21`. */
-  apiKeyHint: text("api_key_hint").notNull(),
-  /** Provider side scope the key resolved to, e.g. a RevenueCat project id. */
-  externalId: text("external_id"),
-  externalName: text("external_name"),
-  lastCheckedAt: timestamp("last_checked_at", { withTimezone: true }),
-  lastError: text("last_error"),
-  connectedByUserId: text("connected_by_user_id").references(() => user.id, {
-    onDelete: "set null",
-  }),
-  connectedAt: timestamp("connected_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-})
+export const providerIntegrations = pgTable(
+  "provider_integrations",
+  {
+    tenantId: tenantId(),
+    appId: appId(),
+    provider: integrationProviderEnum("provider").notNull(),
+    apiKeyEncrypted: text("api_key_encrypted").notNull(),
+    /** Non secret fragment shown in the UI, e.g. `sk_ab…9f21`. */
+    apiKeyHint: text("api_key_hint").notNull(),
+    /** Provider side scope the key resolved to, e.g. a RevenueCat project id. */
+    externalId: text("external_id"),
+    externalName: text("external_name"),
+    lastCheckedAt: timestamp("last_checked_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    connectedByUserId: text("connected_by_user_id").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    connectedAt: timestamp("connected_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.tenantId, table.appId, table.provider] }),
+    appReference(table),
+    tenantIsolation("provider_integrations", table.tenantId),
+  ]
+)
 
 /* -------------------------------------------------------------------------- */
 /* Dashboard: per user widget layout                                           */
@@ -675,25 +986,30 @@ export type DashboardWidgetConfig = {
   layout?: { x: number; y: number; w: number; h: number }
 }
 
-export const dashboardLayouts = pgTable("dashboard_layouts", {
-  userId: text("user_id")
-    .primaryKey()
-    .references(() => user.id, { onDelete: "cascade" }),
-  widgets: jsonb("widgets")
-    .$type<DashboardWidgetConfig[]>()
-    .notNull()
-    .default([]),
-  updatedAt: timestamp("updated_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-})
+export const dashboardLayouts = pgTable(
+  "dashboard_layouts",
+  {
+    userId: text("user_id")
+      .primaryKey()
+      .references(() => user.id, { onDelete: "cascade" }),
+    tenantId: tenantId(),
+    widgets: jsonb("widgets")
+      .$type<DashboardWidgetConfig[]>()
+      .notNull()
+      .default([]),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [tenantIsolation("dashboard_layouts", table.tenantId)]
+)
 
 /* -------------------------------------------------------------------------- */
 /* Sideshift: campaign analytics read over OAuth                               */
 /* -------------------------------------------------------------------------- */
 
 /**
- * The single Sideshift connection for this deployment. Sideshift is reached
+ * Each tenant's Sideshift connection. Sideshift is reached
  * over OAuth rather than a pasted key, so this holds the OAuth client Yak
  * registered for itself, the founder's tokens, and the in-flight authorization
  * request. Every secret is AES-256-GCM ciphertext and never leaves the server.
@@ -701,68 +1017,93 @@ export const dashboardLayouts = pgTable("dashboard_layouts", {
  * The client registration survives a disconnect so reconnecting does not
  * register a second client with Sideshift.
  */
-export const sideshiftConnection = pgTable("sideshift_connection", {
-  id: text("id").primaryKey().default("default"),
-  status: sideshiftConnectionStatusEnum("status")
-    .notNull()
-    .default("disconnected"),
+export const sideshiftConnection = pgTable(
+  "sideshift_connection",
+  {
+    tenantId: text("tenant_id")
+      .primaryKey()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    status: sideshiftConnectionStatusEnum("status")
+      .notNull()
+      .default("disconnected"),
 
-  clientId: text("client_id"),
-  clientSecretEncrypted: text("client_secret_encrypted"),
-  registrationAccessTokenEncrypted: text("registration_access_token_encrypted"),
-  /** The callback the client was registered with; a new API_URL re-registers. */
-  redirectUri: text("redirect_uri"),
+    clientId: text("client_id"),
+    clientSecretEncrypted: text("client_secret_encrypted"),
+    registrationAccessTokenEncrypted: text(
+      "registration_access_token_encrypted"
+    ),
+    /** The callback the client was registered with; a new API_URL re-registers. */
+    redirectUri: text("redirect_uri"),
 
-  accessTokenEncrypted: text("access_token_encrypted"),
-  accessTokenExpiresAt: timestamp("access_token_expires_at", {
-    withTimezone: true,
-  }),
-  refreshTokenEncrypted: text("refresh_token_encrypted"),
-  scope: text("scope"),
-  companyId: text("company_id"),
-  companyName: text("company_name"),
-  connectedByUserId: text("connected_by_user_id").references(() => user.id, {
-    onDelete: "set null",
-  }),
-  connectedAt: timestamp("connected_at", { withTimezone: true }),
+    accessTokenEncrypted: text("access_token_encrypted"),
+    accessTokenExpiresAt: timestamp("access_token_expires_at", {
+      withTimezone: true,
+    }),
+    refreshTokenEncrypted: text("refresh_token_encrypted"),
+    scope: text("scope"),
+    companyId: text("company_id"),
+    companyName: text("company_name"),
+    connectedByUserId: text("connected_by_user_id").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    connectedAt: timestamp("connected_at", { withTimezone: true }),
 
-  /** SHA-256 of the pending `state`; the raw value only exists in the URL. */
-  oauthStateHash: text("oauth_state_hash"),
-  oauthVerifierEncrypted: text("oauth_verifier_encrypted"),
-  oauthStartedAt: timestamp("oauth_started_at", { withTimezone: true }),
-  oauthStartedByUserId: text("oauth_started_by_user_id"),
+    /** SHA-256 of the pending `state`; the raw value only exists in the URL. */
+    oauthStateHash: text("oauth_state_hash"),
+    oauthVerifierEncrypted: text("oauth_verifier_encrypted"),
+    oauthStartedAt: timestamp("oauth_started_at", { withTimezone: true }),
+    oauthStartedByUserId: text("oauth_started_by_user_id"),
+    /**
+     * The authorization code Sideshift returned, held until the user who
+     * clicked Connect confirms from their own signed-in panel session.
+     */
+    oauthCodeEncrypted: text("oauth_code_encrypted"),
 
-  syncStartedAt: timestamp("sync_started_at", { withTimezone: true }),
-  lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
-  lastError: text("last_error"),
-  lastErrorAt: timestamp("last_error_at", { withTimezone: true }),
-  /** Sideshift's `requestId` for the last failure, for their support. */
-  lastErrorRequestId: text("last_error_request_id"),
+    syncStartedAt: timestamp("sync_started_at", { withTimezone: true }),
+    lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    lastErrorAt: timestamp("last_error_at", { withTimezone: true }),
+    /** Sideshift's `requestId` for the last failure, for their support. */
+    lastErrorRequestId: text("last_error_request_id"),
 
-  updatedAt: timestamp("updated_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-})
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    tenantIsolation("sideshift_connection", table.tenantId),
+    // The OAuth callback finds its connection by state before it knows whose.
+    lookupAccess("sideshift_connection"),
+  ]
+)
 
 /** Every campaign Sideshift reports, and whether the founder tracks it. */
-export const sideshiftCampaigns = pgTable("sideshift_campaigns", {
-  id: text("id").primaryKey(),
-  name: text("name").notNull(),
-  status: text("status").notNull(),
-  tracked: boolean("tracked").notNull().default(false),
-  /** Set when the campaign stops appearing in Sideshift's list. */
-  removedAt: timestamp("removed_at", { withTimezone: true }),
-  /** Set once the daily history for this campaign has been backfilled. */
-  historyBackfilledAt: timestamp("history_backfilled_at", {
-    withTimezone: true,
-  }),
-  firstSeenAt: timestamp("first_seen_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-})
+export const sideshiftCampaigns = pgTable(
+  "sideshift_campaigns",
+  {
+    tenantId: tenantId(),
+    id: text("id").notNull(),
+    name: text("name").notNull(),
+    status: text("status").notNull(),
+    tracked: boolean("tracked").notNull().default(false),
+    /** Set when the campaign stops appearing in Sideshift's list. */
+    removedAt: timestamp("removed_at", { withTimezone: true }),
+    /** Set once the daily history for this campaign has been backfilled. */
+    historyBackfilledAt: timestamp("history_backfilled_at", {
+      withTimezone: true,
+    }),
+    firstSeenAt: timestamp("first_seen_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.tenantId, table.id] }),
+    tenantIsolation("sideshift_campaigns", table.tenantId),
+  ]
+)
 
 /**
  * Posts in tracked campaigns with their latest cumulative stats. A post can
@@ -771,7 +1112,8 @@ export const sideshiftCampaigns = pgTable("sideshift_campaigns", {
 export const sideshiftPosts = pgTable(
   "sideshift_posts",
   {
-    id: text("id").primaryKey(),
+    tenantId: tenantId(),
+    id: text("id").notNull(),
     platform: text("platform").notNull(),
     creatorId: text("creator_id"),
     creatorHandle: text("creator_handle"),
@@ -790,35 +1132,54 @@ export const sideshiftPosts = pgTable(
       .defaultNow(),
   },
   (table) => [
+    primaryKey({ columns: [table.tenantId, table.id] }),
     index("sideshift_posts_campaign_ids_idx").using("gin", table.campaignIds),
-    index("sideshift_posts_uploaded_at_idx").on(table.uploadedAt),
+    index("sideshift_posts_tenant_id_uploaded_at_idx").on(
+      table.tenantId,
+      table.uploadedAt
+    ),
+    tenantIsolation("sideshift_posts", table.tenantId),
   ]
 )
 
 /** Creator display identities, for names and avatars in the creators table. */
-export const sideshiftCreators = pgTable("sideshift_creators", {
-  id: text("id").primaryKey(),
-  name: text("name").notNull(),
-  avatarUrl: text("avatar_url"),
-  updatedAt: timestamp("updated_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-})
+export const sideshiftCreators = pgTable(
+  "sideshift_creators",
+  {
+    tenantId: tenantId(),
+    id: text("id").notNull(),
+    name: text("name").notNull(),
+    avatarUrl: text("avatar_url"),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.tenantId, table.id] }),
+    tenantIsolation("sideshift_creators", table.tenantId),
+  ]
+)
 
 /** Views and engagement gained per campaign per day, summed from post deltas. */
 export const sideshiftDaily = pgTable(
   "sideshift_daily",
   {
-    campaignId: text("campaign_id")
-      .notNull()
-      .references(() => sideshiftCampaigns.id, { onDelete: "cascade" }),
+    tenantId: tenantId(),
+    campaignId: text("campaign_id").notNull(),
     date: date("date", { mode: "string" }).notNull(),
     views: bigint("views", { mode: "number" }).notNull().default(0),
     likes: bigint("likes", { mode: "number" }).notNull().default(0),
     comments: bigint("comments", { mode: "number" }).notNull().default(0),
     shares: bigint("shares", { mode: "number" }).notNull().default(0),
   },
-  (table) => [primaryKey({ columns: [table.campaignId, table.date] })]
+  (table) => [
+    primaryKey({ columns: [table.tenantId, table.campaignId, table.date] }),
+    foreignKey({
+      columns: [table.tenantId, table.campaignId],
+      foreignColumns: [sideshiftCampaigns.tenantId, sideshiftCampaigns.id],
+    }).onDelete("cascade"),
+    tenantIsolation("sideshift_daily", table.tenantId),
+  ]
 )
 
 /**
@@ -829,12 +1190,9 @@ export const sideshiftDaily = pgTable(
 export const sideshiftPostDaily = pgTable(
   "sideshift_post_daily",
   {
-    postId: text("post_id")
-      .notNull()
-      .references(() => sideshiftPosts.id, { onDelete: "cascade" }),
-    campaignId: text("campaign_id")
-      .notNull()
-      .references(() => sideshiftCampaigns.id, { onDelete: "cascade" }),
+    tenantId: tenantId(),
+    postId: text("post_id").notNull(),
+    campaignId: text("campaign_id").notNull(),
     date: date("date", { mode: "string" }).notNull(),
     views: bigint("views", { mode: "number" }).notNull().default(0),
     likes: bigint("likes", { mode: "number" }).notNull().default(0),
@@ -842,8 +1200,23 @@ export const sideshiftPostDaily = pgTable(
     shares: bigint("shares", { mode: "number" }).notNull().default(0),
   },
   (table) => [
-    primaryKey({ columns: [table.postId, table.campaignId, table.date] }),
-    index("sideshift_post_daily_campaign_date_idx").on(table.campaignId, table.date),
+    primaryKey({
+      columns: [table.tenantId, table.postId, table.campaignId, table.date],
+    }),
+    foreignKey({
+      columns: [table.tenantId, table.postId],
+      foreignColumns: [sideshiftPosts.tenantId, sideshiftPosts.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      columns: [table.tenantId, table.campaignId],
+      foreignColumns: [sideshiftCampaigns.tenantId, sideshiftCampaigns.id],
+    }).onDelete("cascade"),
+    index("sideshift_post_daily_tenant_id_campaign_date_idx").on(
+      table.tenantId,
+      table.campaignId,
+      table.date
+    ),
+    tenantIsolation("sideshift_post_daily", table.tenantId),
   ]
 )
 
@@ -851,6 +1224,9 @@ export const sideshiftPostDaily = pgTable(
 /* Inferred types                                                              */
 /* -------------------------------------------------------------------------- */
 
+export type Tenant = typeof tenants.$inferSelect
+export type PlanTier = Tenant["plan"]
+export type App = typeof apps.$inferSelect
 export type User = typeof user.$inferSelect
 export type Session = typeof session.$inferSelect
 export type ActivityLogEntry = typeof activityLog.$inferSelect

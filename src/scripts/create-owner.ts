@@ -1,80 +1,83 @@
-import { and, count, eq } from "drizzle-orm"
+import { count, eq } from "drizzle-orm"
 
-import { auth } from "../auth/auth.js"
+import { SUPER_ADMIN_ROLE } from "../auth/permissions.js"
 import { closeDatabase, db } from "../db/index.js"
-import {
-  account as accountTable,
-  session as sessionTable,
-  user as userTable,
-} from "../db/schema.js"
+import { apps, tenants, type Tenant, user as userTable } from "../db/schema.js"
+import { withStaffScope } from "../db/scope.js"
 import { env } from "../env.js"
-import { generateTemporaryPassword } from "../lib/crypto.js"
+import { newId } from "../lib/crypto.js"
 import { logger } from "../logger.js"
 import { sendInviteEmail } from "../services/email.js"
+import {
+  createPanelUser,
+  issueTemporaryPassword,
+} from "../services/panel-accounts.js"
 
-export type CreateOwnerResult =
-  | { status: "created"; email: string; temporaryPassword: string; inviteEmailSent: boolean }
+export type CreateAccountResult =
+  | {
+      status: "created"
+      email: string
+      temporaryPassword: string
+      inviteEmailSent: boolean
+    }
   | { status: "exists"; email: string }
   | { status: "skipped"; reason: string }
 
-export type ResetOwnerResult =
-  | { status: "reset"; email: string; temporaryPassword: string }
+export type ResetPasswordResult =
+  | {
+      status: "reset"
+      email: string
+      /** Null when the password was emailed; printing it is then unnecessary. */
+      temporaryPassword: string | null
+      emailSent: boolean
+    }
   | { status: "skipped"; reason: string }
 
-/**
- * Bootstraps the first owner.
- *
- * There is no public sign-up, so this is the only way to create an account on a
- * fresh deployment. Everyone after this is invited from the panel.
- */
-export async function createOwnerAccount(options: {
-  email: string
-  name?: string
-}): Promise<CreateOwnerResult> {
-  const email = options.email.trim().toLowerCase()
-  const name = options.name?.trim() || "Owner"
-
-  if (!email) {
-    return { status: "skipped", reason: "No email provided" }
-  }
-
+async function emailTaken(email: string) {
   const [existing] = await db
     .select({ id: userTable.id })
     .from(userTable)
     .where(eq(userTable.email, email))
     .limit(1)
 
-  if (existing) {
+  return Boolean(existing)
+}
+
+/**
+ * Bootstraps a super admin.
+ *
+ * There is no public sign-up, so this is how the first account on a fresh
+ * deployment comes into existence. That super admin then creates customer
+ * accounts and their owners from the admin console.
+ */
+export async function createSuperAdminAccount(options: {
+  email: string
+  name?: string
+}): Promise<CreateAccountResult> {
+  const email = options.email.trim().toLowerCase()
+  const name = options.name?.trim() || "Super admin"
+
+  if (!email) {
+    return { status: "skipped", reason: "No email provided" }
+  }
+
+  if (await emailTaken(email)) {
     return { status: "exists", email }
   }
 
-  const context = await auth.$context
-  const temporaryPassword = generateTemporaryPassword()
-
-  const created = await context.internalAdapter.createUser({
-    name,
+  const { temporaryPassword } = await createPanelUser({
+    tenantId: null,
     email,
-    emailVerified: true,
-    role: "owner",
+    name,
+    role: SUPER_ADMIN_ROLE,
   })
-
-  await context.internalAdapter.linkAccount({
-    userId: created.id,
-    accountId: created.id,
-    providerId: "credential",
-    password: await context.password.hash(temporaryPassword),
-  })
-
-  await db
-    .update(userTable)
-    .set({ role: "owner", mustChangePassword: true, invitedAt: new Date() })
-    .where(eq(userTable.id, created.id))
 
   const delivered = await sendInviteEmail({
     to: email,
     name,
     temporaryPassword,
     invitedByName: "Setup",
+    workspaceName: env.APP_NAME,
   })
 
   return {
@@ -85,32 +88,120 @@ export async function createOwnerAccount(options: {
   }
 }
 
-/** Only runs when the users table is empty, so a redeploy cannot mint a second owner. */
-export async function bootstrapOwnerFromEnv(): Promise<CreateOwnerResult | null> {
-  if (!env.OWNER_EMAIL) {
-    return null
-  }
+/**
+ * An account always has at least one app, named after it, so its owner can
+ * start connecting straight away. The admin console creates it with the
+ * account; this covers an account that somehow has none. The `apps` table is
+ * behind row level security, so this runs as staff.
+ */
+async function ensureFirstApp(tenant: Tenant) {
+  await withStaffScope(async (staff) => {
+    const [existing] = await staff
+      .select({ id: apps.id })
+      .from(apps)
+      .where(eq(apps.tenantId, tenant.id))
+      .limit(1)
 
-  const [row] = await db.select({ total: count() }).from(userTable)
-  if ((row?.total ?? 0) > 0) {
-    return { status: "skipped", reason: "Users already exist" }
-  }
+    if (existing) {
+      return
+    }
 
-  return createOwnerAccount({
-    email: env.OWNER_EMAIL,
-    name: env.OWNER_NAME,
+    await staff.insert(apps).values({
+      id: newId(),
+      tenantId: tenant.id,
+      name: tenant.name,
+      slug: tenant.slug,
+    })
   })
 }
 
 /**
- * Issues a new temporary password for an existing owner. Used when email is
- * not configured and the first-boot password was never delivered.
+ * Adds an owner to an existing tenant. The admin console does the same; this
+ * is for scripting and for recovering an account whose owners are all gone.
  */
-export async function resetOwnerPassword(email: string): Promise<ResetOwnerResult> {
+export async function createOwnerAccount(options: {
+  tenantSlug: string
+  email: string
+  name?: string
+}): Promise<CreateAccountResult> {
+  const email = options.email.trim().toLowerCase()
+  const name = options.name?.trim() || "Owner"
+
+  const [tenant] = await db
+    .select()
+    .from(tenants)
+    .where(eq(tenants.slug, options.tenantSlug.trim().toLowerCase()))
+    .limit(1)
+
+  if (!tenant) {
+    return {
+      status: "skipped",
+      reason: `No account with slug ${options.tenantSlug}`,
+    }
+  }
+
+  if (await emailTaken(email)) {
+    return { status: "exists", email }
+  }
+
+  await ensureFirstApp(tenant)
+
+  const { temporaryPassword } = await createPanelUser({
+    tenantId: tenant.id,
+    email,
+    name,
+    role: "owner",
+  })
+
+  const delivered = await sendInviteEmail({
+    to: email,
+    name,
+    temporaryPassword,
+    invitedByName: "Setup",
+    workspaceName: tenant.name,
+  })
+
+  return {
+    status: "created",
+    email,
+    temporaryPassword,
+    inviteEmailSent: delivered,
+  }
+}
+
+/** Only runs while no super admin exists, so a redeploy cannot mint another. */
+export async function bootstrapSuperAdminFromEnv(): Promise<CreateAccountResult | null> {
+  if (!env.SUPER_ADMIN_EMAIL) {
+    return null
+  }
+
+  const [row] = await db
+    .select({ total: count() })
+    .from(userTable)
+    .where(eq(userTable.role, SUPER_ADMIN_ROLE))
+
+  if ((row?.total ?? 0) > 0) {
+    return { status: "skipped", reason: "A super admin already exists" }
+  }
+
+  return createSuperAdminAccount({
+    email: env.SUPER_ADMIN_EMAIL,
+    name: env.SUPER_ADMIN_NAME,
+  })
+}
+
+/**
+ * Issues a new temporary password for any account. Emailed when an email
+ * service is configured; only otherwise is it handed back to be printed, so a
+ * production log never carries a live credential.
+ */
+export async function resetAccountPassword(
+  email: string
+): Promise<ResetPasswordResult> {
   const normalized = email.trim().toLowerCase()
 
   const [existing] = await db
-    .select({ id: userTable.id, email: userTable.email })
+    .select({ id: userTable.id, email: userTable.email, name: userTable.name })
     .from(userTable)
     .where(eq(userTable.email, normalized))
     .limit(1)
@@ -119,56 +210,40 @@ export async function resetOwnerPassword(email: string): Promise<ResetOwnerResul
     return { status: "skipped", reason: `No account for ${normalized}` }
   }
 
-  const context = await auth.$context
-  const temporaryPassword = generateTemporaryPassword()
-  const password = await context.password.hash(temporaryPassword)
+  const temporaryPassword = await issueTemporaryPassword(existing.id)
 
-  const [credential] = await db
-    .select({ id: accountTable.id })
-    .from(accountTable)
-    .where(
-      and(
-        eq(accountTable.userId, existing.id),
-        eq(accountTable.providerId, "credential")
-      )
-    )
-    .limit(1)
+  const emailSent = env.email.configured
+    ? await sendInviteEmail({
+        to: existing.email,
+        name: existing.name,
+        temporaryPassword,
+        invitedByName: `${env.APP_NAME} setup`,
+        workspaceName: env.APP_NAME,
+      })
+    : false
 
-  if (credential) {
-    await db
-      .update(accountTable)
-      .set({ password, updatedAt: new Date() })
-      .where(eq(accountTable.id, credential.id))
-  } else {
-    await context.internalAdapter.linkAccount({
-      userId: existing.id,
-      accountId: existing.id,
-      providerId: "credential",
-      password,
-    })
+  return {
+    status: "reset",
+    email: existing.email,
+    temporaryPassword: env.email.configured ? null : temporaryPassword,
+    emailSent,
   }
-
-  await db
-    .update(userTable)
-    .set({ mustChangePassword: true, updatedAt: new Date() })
-    .where(eq(userTable.id, existing.id))
-
-  await db.delete(sessionTable).where(eq(sessionTable.userId, existing.id))
-
-  return { status: "reset", email: existing.email, temporaryPassword }
 }
 
-/** One-shot boot path. Set OWNER_RESET_PASSWORD=true, then remove it after. */
-export async function resetOwnerFromEnv(): Promise<ResetOwnerResult | null> {
-  if (process.env.OWNER_RESET_PASSWORD !== "true") {
+/**
+ * One-shot boot path. Set SUPER_ADMIN_RESET_PASSWORD=true, then remove it
+ * after.
+ */
+export async function resetSuperAdminFromEnv(): Promise<ResetPasswordResult | null> {
+  if (process.env.SUPER_ADMIN_RESET_PASSWORD !== "true") {
     return null
   }
 
-  if (!env.OWNER_EMAIL) {
-    return { status: "skipped", reason: "OWNER_EMAIL not set" }
+  if (!env.SUPER_ADMIN_EMAIL) {
+    return { status: "skipped", reason: "SUPER_ADMIN_EMAIL not set" }
   }
 
-  return resetOwnerPassword(env.OWNER_EMAIL)
+  return resetAccountPassword(env.SUPER_ADMIN_EMAIL)
 }
 
 function printCredentials(email: string, temporaryPassword: string) {
@@ -178,34 +253,69 @@ function printCredentials(email: string, temporaryPassword: string) {
   console.log("  You will be asked to change it immediately.\n")
 }
 
-async function main() {
-  const args = process.argv.slice(2).filter((arg) => arg !== "--reset")
-  const reset = process.argv.includes("--reset")
-  const email = (args[0] ?? env.OWNER_EMAIL)?.trim().toLowerCase()
-  const name = args[1] ?? env.OWNER_NAME ?? "Owner"
+const USAGE = [
+  "Usage:",
+  '  npm run create:super-admin -- you@example.com "Your Name"',
+  '  npm run create:owner -- <account-slug> owner@example.com "Owner Name"',
+  "  npm run create:super-admin -- you@example.com --reset",
+].join("\n")
 
-  if (!email) {
-    throw new Error(
-      "Provide an email: npm run create:owner -- you@example.com \"Your Name\""
-    )
-  }
+async function main() {
+  const reset = process.argv.includes("--reset")
+  const superAdmin = process.argv.includes("--super-admin")
+  const args = process.argv
+    .slice(2)
+    .filter((arg) => arg !== "--reset" && arg !== "--super-admin")
 
   if (reset) {
-    const resetResult = await resetOwnerPassword(email)
-
-    if (resetResult.status === "skipped") {
-      throw new Error(resetResult.reason)
+    const email = args[0] ?? env.SUPER_ADMIN_EMAIL
+    if (!email) {
+      throw new Error(USAGE)
     }
 
-    logger.info({ email: resetResult.email }, "Owner password reset")
-    printCredentials(resetResult.email, resetResult.temporaryPassword)
+    const result = await resetAccountPassword(email)
+
+    if (result.status === "skipped") {
+      throw new Error(result.reason)
+    }
+
+    logger.info({ email: result.email }, "Password reset")
+
+    if (result.temporaryPassword) {
+      printCredentials(result.email, result.temporaryPassword)
+    } else if (result.emailSent) {
+      console.log(`\n  A temporary password was emailed to ${result.email}.\n`)
+    } else {
+      throw new Error(
+        "The password email could not be sent. Fix the email service and run the reset again."
+      )
+    }
+
     return
   }
 
-  const result = await createOwnerAccount({ email, name })
+  const result = superAdmin
+    ? await createSuperAdminAccount({
+        email: args[0] ?? env.SUPER_ADMIN_EMAIL ?? "",
+        name: args[1] ?? env.SUPER_ADMIN_NAME,
+      })
+    : args.length >= 2
+      ? await createOwnerAccount({
+          tenantSlug: args[0]!,
+          email: args[1]!,
+          name: args[2],
+        })
+      : null
+
+  if (!result) {
+    throw new Error(USAGE)
+  }
 
   if (result.status === "exists") {
-    logger.info({ email: result.email }, "That account already exists - nothing to do")
+    logger.info(
+      { email: result.email },
+      "That account already exists - nothing to do"
+    )
     return
   }
 
@@ -216,10 +326,10 @@ async function main() {
   logger.info(
     {
       email: result.email,
-      role: "owner",
+      role: superAdmin ? SUPER_ADMIN_ROLE : "owner",
       inviteEmailSent: result.inviteEmailSent,
     },
-    "Owner created"
+    "Account created"
   )
 
   if (!result.inviteEmailSent) {
@@ -234,7 +344,7 @@ const isDirectRun =
 if (isDirectRun) {
   main()
     .catch((error) => {
-      logger.error({ err: error }, "Could not create owner")
+      logger.error({ err: error }, "Could not create account")
       process.exitCode = 1
     })
     .finally(async () => {

@@ -4,7 +4,21 @@ Backend for the Stand admin panel. Node.js + TypeScript + Express on Postgres,
 deployed independently of the frontend so each repo gets its own Railway
 deploy trigger.
 
-One deployed instance serves exactly one customer application.
+One deployment serves every customer account (tenant). An account owns any
+number of **apps**; what an app sends through the ingest API (events, end
+users, reports) and the credentials it sends with (API keys, RevenueCat)
+belong to that app, while the team's own things (tasks, branding, Discord,
+webhooks, Sideshift) belong to the account. Pricing is per account, by monthly
+active users added up across its apps.
+
+Every customer-owned row carries `tenant_id`, every query filters on the
+tenant taken from the session or API key, and Postgres **row level security**
+enforces the same thing underneath: each request runs on a connection bound to
+its tenant, and a query that forgot its filter returns nothing rather than
+another customer's rows. Yak staff sign in as **super admins** to create and
+manage accounts; their requests run in a staff scope that the policies only
+admit to account metadata, never to end user tables, so they cannot see inside
+an account even by mistake.
 
 ## What it does
 
@@ -32,7 +46,10 @@ cp .env.example .env
 ```
 
 Fill in `.env`. At minimum you need `DATABASE_URL`, `BETTER_AUTH_SECRET`, and
-`ENCRYPTION_KEY`. Generate the two secrets with:
+`ENCRYPTION_KEY`. Locally `DATABASE_URL` may be a superuser (the boot log
+warns that row level security is bypassed); in production it must be a plain
+role, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Generate the two secrets
+with:
 
 ```bash
 openssl rand -base64 32   # BETTER_AUTH_SECRET
@@ -44,11 +61,12 @@ Then create the schema, seed sample data, and create the first account:
 ```bash
 npm run db:migrate
 npm run seed
-npm run create:owner -- you@example.com "Your Name"
+npm run create:super-admin -- you@example.com "Your Name"
 npm run dev
 ```
 
-`create:owner` prints a temporary password when email is not configured. The
+Sign in at `/admin` and create an account and its owner from there.
+`create:super-admin` prints a temporary password when email is not configured. The
 panel forces you to replace it on first sign in.
 
 ## Scripts
@@ -62,8 +80,9 @@ panel forces you to replace it on first sign in.
 | `npm run db:generate` | Diff `src/db/schema.ts` into a new SQL migration. |
 | `npm run db:migrate` | Apply pending migrations. |
 | `npm run db:studio` | Browse the database. |
-| `npm run seed` | Insert demo data. No-op if data already exists. |
-| `npm run create:owner` | Bootstrap the first owner account. |
+| `npm run seed` | `-- <account-slug>` inserts demo data into that account (default: the oldest). No-op if it already has data. |
+| `npm run create:super-admin` | Bootstrap a super admin. `-- email --reset` reissues a password. |
+| `npm run create:owner` | `-- <account-slug> email "Name"` adds an owner to an account. |
 
 ## Layout
 
@@ -73,7 +92,8 @@ src/
   index.ts          Listener and graceful shutdown
   env.ts            Zod-validated environment, fails fast on boot
   auth/             Better Auth instance, roles, permission rules
-  db/               Drizzle schema, pool, migration runner
+  billing/          Pricing tiers (Stripe keys are read, nothing calls it yet)
+  db/               Drizzle schema with RLS policies, pool, per-request scope, migration runner
   middleware/       Session, permissions, API keys, validation, errors
   routes/           Panel routers, plus routes/public for the ingest API
   services/         Cloudflare email + R2, Discord, webhooks, activity
@@ -82,7 +102,17 @@ src/
 
 ## Authorization
 
-Two independent axes, both enforced server side on every request:
+**Tenancy** comes first. A session or API key belongs to exactly one tenant,
+and every panel and ingest route acts on that tenant only; an API key further
+belongs to one of the tenant's apps, and panel routes for app data live under
+`/api/apps/:appId`, which must be the tenant's own. A suspended tenant's panel
+and ingest API are refused. Super admins have no tenant: they reach `/api/me`
+and `/api/admin` and nothing else. Of Better Auth's endpoints only five are
+reachable (sign in, sign out, get session, request reset, reset); its admin
+plugin is not installed and every other path answers 404.
+
+Inside a tenant, two independent axes, both enforced server side on every
+request:
 
 - **Role** decides who can administer the panel. `owner` and `admin` can invite
   users and mint API keys; `member` cannot. Only an owner can modify another
@@ -96,6 +126,9 @@ from the session payload, so revoking access takes effect immediately.
 
 ## Security notes
 
+- Every customer table has row level security keyed to a per-connection
+  setting (`src/db/scope.ts`); the server refuses to start in production as a
+  role that bypasses it.
 - Sessions are httpOnly cookies. In production they are `Secure`, `SameSite=None`,
   and partitioned, because the panel and API sit on different Railway hosts.
 - CORS is a strict allowlist built from `APP_URL` plus `CORS_ORIGINS`.

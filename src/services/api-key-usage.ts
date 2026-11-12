@@ -1,8 +1,8 @@
 import { eq } from "drizzle-orm"
 import type { Request } from "express"
 
-import { db } from "../db/index.js"
 import { apiKeys } from "../db/schema.js"
+import { withTenantScope } from "../db/scope.js"
 import { logger } from "../logger.js"
 
 const MAX_MESSAGE_LENGTH = 300
@@ -28,10 +28,11 @@ function endpointLabel(req: Request): string {
  * can show why an integration is failing instead of just "Never used".
  *
  * Best effort, like usage tracking: a write failure here must not change the
- * response the caller was already going to get.
+ * response the caller was already going to get. Runs in the key's own tenant
+ * scope since it is called before, or after, the request has one.
  */
 export function recordApiKeyFailure(
-  apiKeyId: string,
+  key: { id: string; tenantId: string },
   req: Request,
   failure: { status: number; code: string; detail?: string }
 ): void {
@@ -43,7 +44,7 @@ export function recordApiKeyFailure(
     .join(": ")
     .slice(0, MAX_MESSAGE_LENGTH)
 
-  const previous = lastRecorded.get(apiKeyId)
+  const previous = lastRecorded.get(key.id)
   const now = Date.now()
 
   if (
@@ -54,13 +55,14 @@ export function recordApiKeyFailure(
     return
   }
 
-  lastRecorded.set(apiKeyId, { message, at: now })
+  lastRecorded.set(key.id, { message, at: now })
 
-  void db
-    .update(apiKeys)
-    .set({ lastErrorAt: new Date(now), lastError: message })
-    .where(eq(apiKeys.id, apiKeyId))
-    .catch((error: unknown) => {
-      logger.warn({ err: error }, "Could not record API key failure")
-    })
+  void withTenantScope(key.tenantId, (scoped) =>
+    scoped
+      .update(apiKeys)
+      .set({ lastErrorAt: new Date(now), lastError: message })
+      .where(eq(apiKeys.id, key.id))
+  ).catch((error: unknown) => {
+    logger.warn({ err: error }, "Could not record API key failure")
+  })
 }

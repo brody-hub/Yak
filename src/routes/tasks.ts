@@ -1,4 +1,4 @@
-import { asc, desc, eq } from "drizzle-orm"
+import { and, asc, desc, eq } from "drizzle-orm"
 import { Router } from "express"
 import { z } from "zod"
 
@@ -16,10 +16,11 @@ import {
   serializeTicket,
   serializeTicketHistory,
 } from "../lib/serializers.js"
-import { getAuth } from "../middleware/auth.js"
+import { getAuth, getTenantId } from "../middleware/auth.js"
 import { validate } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
 import { fireDiscordTrigger } from "../services/discord.js"
+import { nextTicketNumber } from "../services/tenants.js"
 
 export const tasksRouter: Router = Router()
 
@@ -54,6 +55,44 @@ const ticketUpdateSchema = z
 
 type TicketUpdate = z.infer<typeof ticketUpdateSchema>
 
+/**
+ * A sprint or assignee named in a request body has to belong to the caller's
+ * tenant, or a ticket could be filed into another customer's sprint.
+ */
+async function assertReferences(
+  tenantId: string,
+  refs: { sprintId?: string | null; assigneeId?: string | null }
+) {
+  if (refs.sprintId) {
+    const [sprint] = await db
+      .select({ id: sprints.id })
+      .from(sprints)
+      .where(and(eq(sprints.id, refs.sprintId), eq(sprints.tenantId, tenantId)))
+      .limit(1)
+
+    if (!sprint) {
+      throw new BadRequestError("That sprint does not exist")
+    }
+  }
+
+  if (refs.assigneeId) {
+    const [assignee] = await db
+      .select({ id: userTable.id })
+      .from(userTable)
+      .where(
+        and(
+          eq(userTable.id, refs.assigneeId),
+          eq(userTable.tenantId, tenantId)
+        )
+      )
+      .limit(1)
+
+    if (!assignee) {
+      throw new BadRequestError("That assignee does not exist")
+    }
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /* Sprints                                                                     */
 /* -------------------------------------------------------------------------- */
@@ -64,8 +103,12 @@ function sprintEndDate(startDate: Date, durationWeeks: number): Date {
   return end
 }
 
-tasksRouter.get("/sprints", async (_req, res) => {
-  const rows = await db.select().from(sprints).orderBy(asc(sprints.startDate))
+tasksRouter.get("/sprints", async (req, res) => {
+  const rows = await db
+    .select()
+    .from(sprints)
+    .where(eq(sprints.tenantId, getTenantId(req)))
+    .orderBy(asc(sprints.startDate))
   res.json({ data: rows.map(serializeSprint) })
 })
 
@@ -82,6 +125,7 @@ tasksRouter.post(
   }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
     const body = req.body as {
       name: string
       durationWeeks: 1 | 2
@@ -92,6 +136,7 @@ tasksRouter.post(
       .insert(sprints)
       .values({
         id: newId(),
+        tenantId,
         name: body.name,
         durationWeeks: body.durationWeeks,
         startDate: body.startDate,
@@ -100,6 +145,7 @@ tasksRouter.post(
       .returning()
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "created",
       section: "tasks",
@@ -125,6 +171,7 @@ tasksRouter.patch(
   }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
     const id = req.params.id as string
     const body = req.body as {
       name?: string
@@ -135,7 +182,7 @@ tasksRouter.patch(
     const [existing] = await db
       .select()
       .from(sprints)
-      .where(eq(sprints.id, id))
+      .where(and(eq(sprints.id, id), eq(sprints.tenantId, tenantId)))
       .limit(1)
 
     if (!existing) {
@@ -154,10 +201,11 @@ tasksRouter.patch(
         endDate: sprintEndDate(startDate, durationWeeks),
         updatedAt: new Date(),
       })
-      .where(eq(sprints.id, id))
+      .where(and(eq(sprints.id, id), eq(sprints.tenantId, tenantId)))
       .returning()
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "updated",
       section: "tasks",
@@ -174,12 +222,13 @@ tasksRouter.delete(
   validate({ params: idParamSchema }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
     const id = req.params.id as string
 
     const [existing] = await db
       .select()
       .from(sprints)
-      .where(eq(sprints.id, id))
+      .where(and(eq(sprints.id, id), eq(sprints.tenantId, tenantId)))
       .limit(1)
 
     if (!existing) {
@@ -188,9 +237,12 @@ tasksRouter.delete(
 
     // Tickets survive the sprint; the foreign key nulls their sprintId so they
     // fall back into the backlog rather than disappearing.
-    await db.delete(sprints).where(eq(sprints.id, id))
+    await db
+      .delete(sprints)
+      .where(and(eq(sprints.id, id), eq(sprints.tenantId, tenantId)))
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "deleted",
       section: "tasks",
@@ -206,8 +258,12 @@ tasksRouter.delete(
 /* Tickets                                                                     */
 /* -------------------------------------------------------------------------- */
 
-tasksRouter.get("/tickets", async (_req, res) => {
-  const rows = await db.select().from(tickets).orderBy(desc(tickets.createdAt))
+tasksRouter.get("/tickets", async (req, res) => {
+  const rows = await db
+    .select()
+    .from(tickets)
+    .where(eq(tickets.tenantId, getTenantId(req)))
+    .orderBy(desc(tickets.createdAt))
   res.json({ data: rows.map(serializeTicket) })
 })
 
@@ -235,12 +291,17 @@ tasksRouter.post(
       sprintId: string | null
       assigneeId: string | null
     }
+    const tenantId = getTenantId(req)
+
+    await assertReferences(tenantId, body)
 
     const row = await db.transaction(async (tx) => {
       const [created] = await tx
         .insert(tickets)
         .values({
           id: newId(),
+          tenantId,
+          number: await nextTicketNumber(tx, tenantId),
           title: body.title,
           description: body.description,
           status: body.status,
@@ -257,6 +318,7 @@ tasksRouter.post(
 
       await tx.insert(ticketHistory).values({
         id: newId(),
+        tenantId,
         ticketId: created.id,
         type: "created",
         actorId: user.id,
@@ -266,6 +328,7 @@ tasksRouter.post(
     })
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "created",
       section: "tasks",
@@ -285,7 +348,12 @@ tasksRouter.get(
     const [row] = await db
       .select()
       .from(tickets)
-      .where(eq(tickets.id, req.params.id as string))
+      .where(
+        and(
+          eq(tickets.id, req.params.id as string),
+          eq(tickets.tenantId, getTenantId(req))
+        )
+      )
       .limit(1)
 
     if (!row) {
@@ -304,18 +372,21 @@ tasksRouter.patch(
   }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
     const id = req.params.id as string
     const body = req.body as TicketUpdate
 
     const [existing] = await db
       .select()
       .from(tickets)
-      .where(eq(tickets.id, id))
+      .where(and(eq(tickets.id, id), eq(tickets.tenantId, tenantId)))
       .limit(1)
 
     if (!existing) {
       throw new NotFoundError("Ticket")
     }
+
+    await assertReferences(tenantId, body)
 
     // Diff before writing so the history reflects real transitions rather than
     // every field the client happened to send.
@@ -336,7 +407,7 @@ tasksRouter.patch(
       const [updated] = await tx
         .update(tickets)
         .set({ ...body, updatedAt: new Date() })
-        .where(eq(tickets.id, id))
+        .where(and(eq(tickets.id, id), eq(tickets.tenantId, tenantId)))
         .returning()
 
       if (!updated) {
@@ -346,6 +417,7 @@ tasksRouter.patch(
       await tx.insert(ticketHistory).values(
         changes.map((field) => ({
           id: newId(),
+          tenantId,
           ticketId: id,
           type: "updated" as const,
           field,
@@ -360,6 +432,7 @@ tasksRouter.patch(
     })
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "updated",
       section: "tasks",
@@ -373,12 +446,17 @@ tasksRouter.patch(
         ? await db
             .select({ name: userTable.name })
             .from(userTable)
-            .where(eq(userTable.id, row.assigneeId))
+            .where(
+              and(
+                eq(userTable.id, row.assigneeId),
+                eq(userTable.tenantId, tenantId)
+              )
+            )
             .limit(1)
             .then((rows) => rows[0]?.name ?? null)
         : null
 
-      void fireDiscordTrigger("ticket_status_change", {
+      void fireDiscordTrigger(tenantId, "ticket_status_change", {
         title: `Ticket #${row.number} moved to ${row.status}`,
         description: row.title,
         fields: [
@@ -400,21 +478,25 @@ tasksRouter.delete(
   validate({ params: idParamSchema }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
     const id = req.params.id as string
 
     const [existing] = await db
       .select()
       .from(tickets)
-      .where(eq(tickets.id, id))
+      .where(and(eq(tickets.id, id), eq(tickets.tenantId, tenantId)))
       .limit(1)
 
     if (!existing) {
       throw new NotFoundError("Ticket")
     }
 
-    await db.delete(tickets).where(eq(tickets.id, id))
+    await db
+      .delete(tickets)
+      .where(and(eq(tickets.id, id), eq(tickets.tenantId, tenantId)))
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "deleted",
       section: "tasks",
@@ -433,7 +515,12 @@ tasksRouter.get(
     const rows = await db
       .select()
       .from(ticketHistory)
-      .where(eq(ticketHistory.ticketId, req.params.id as string))
+      .where(
+        and(
+          eq(ticketHistory.ticketId, req.params.id as string),
+          eq(ticketHistory.tenantId, getTenantId(req))
+        )
+      )
       .orderBy(asc(ticketHistory.createdAt))
 
     res.json({ data: rows.map(serializeTicketHistory) })
@@ -441,10 +528,11 @@ tasksRouter.get(
 )
 
 /** Whole-board history, used to hydrate the panel in one request. */
-tasksRouter.get("/history", async (_req, res) => {
+tasksRouter.get("/history", async (req, res) => {
   const rows = await db
     .select()
     .from(ticketHistory)
+    .where(eq(ticketHistory.tenantId, getTenantId(req)))
     .orderBy(desc(ticketHistory.createdAt))
     .limit(500)
 

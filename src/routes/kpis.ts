@@ -1,6 +1,7 @@
 import { Router } from "express"
 import { z } from "zod"
 
+import { getScope } from "../middleware/auth.js"
 import { validate, validatedQuery } from "../middleware/validate.js"
 import {
   fetchChart,
@@ -11,7 +12,8 @@ import {
   type RevenueCatMetric,
 } from "../services/revenuecat.js"
 
-export const kpisRouter: Router = Router()
+/** Mounted under /apps/:appId: RevenueCat is connected per app. */
+export const kpisRouter: Router = Router({ mergeParams: true })
 
 /**
  * Subscription KPIs.
@@ -34,10 +36,7 @@ type KpiSummary = {
   arpu: number | null
 }
 
-function metricValue(
-  metrics: RevenueCatMetric[],
-  id: string
-): number | null {
+function metricValue(metrics: RevenueCatMetric[], id: string): number | null {
   return metrics.find((metric) => metric.id === id)?.value ?? null
 }
 
@@ -60,8 +59,11 @@ function buildSummary(metrics: RevenueCatMetric[]): KpiSummary {
   }
 }
 
-kpisRouter.get("/overview", async (_req, res) => {
-  const credential = await loadRevenueCatCredential()
+kpisRouter.get("/overview", async (req, res) => {
+  const credential = await loadRevenueCatCredential(
+    getScope(req).tenantId,
+    getScope(req).appId
+  )
 
   if (!credential) {
     res.json({
@@ -105,7 +107,10 @@ kpisRouter.get(
       days: number
     }>(req)
 
-    const credential = await loadRevenueCatCredential()
+    const credential = await loadRevenueCatCredential(
+      getScope(req).tenantId,
+      getScope(req).appId
+    )
 
     if (!credential) {
       res.json({

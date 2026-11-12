@@ -1,4 +1,13 @@
-import { and, arrayOverlaps, asc, eq, gte, inArray, isNull, sql } from "drizzle-orm"
+import {
+  and,
+  arrayOverlaps,
+  asc,
+  eq,
+  gte,
+  inArray,
+  isNull,
+  sql,
+} from "drizzle-orm"
 
 import { db } from "../../db/index.js"
 import {
@@ -42,12 +51,16 @@ function rate(engagement: number, views: number) {
   return views > 0 ? engagement / views : null
 }
 
-export async function trackedCampaigns() {
+export async function trackedCampaigns(tenantId: string) {
   return db
     .select()
     .from(sideshiftCampaigns)
     .where(
-      and(eq(sideshiftCampaigns.tracked, true), isNull(sideshiftCampaigns.removedAt))
+      and(
+        eq(sideshiftCampaigns.tenantId, tenantId),
+        eq(sideshiftCampaigns.tracked, true),
+        isNull(sideshiftCampaigns.removedAt)
+      )
     )
     .orderBy(asc(sideshiftCampaigns.name))
 }
@@ -56,8 +69,11 @@ export async function trackedCampaigns() {
 /* Connection status                                                           */
 /* -------------------------------------------------------------------------- */
 
-export async function sideshiftStatus({ privileged }: { privileged: boolean }) {
-  const row = await loadConnection()
+export async function sideshiftStatus(
+  tenantId: string,
+  { privileged }: { privileged: boolean }
+) {
+  const row = await loadConnection(tenantId)
   const status = row?.status ?? "disconnected"
   const campaigns =
     status === "disconnected"
@@ -70,19 +86,25 @@ export async function sideshiftStatus({ privileged }: { privileged: boolean }) {
             tracked: sideshiftCampaigns.tracked,
           })
           .from(sideshiftCampaigns)
-          .where(isNull(sideshiftCampaigns.removedAt))
+          .where(
+            and(
+              eq(sideshiftCampaigns.tenantId, tenantId),
+              isNull(sideshiftCampaigns.removedAt)
+            )
+          )
           .orderBy(asc(sideshiftCampaigns.name))
 
   return {
     status,
     connected: status !== "disconnected",
-    companyId: row?.companyId ?? null,
-    companyName: row?.companyName ?? null,
+    // Operator details stay with owners and admins, as on the integrations page.
+    companyId: privileged ? (row?.companyId ?? null) : null,
+    companyName: privileged ? (row?.companyName ?? null) : null,
     connectedAt: row?.connectedAt?.toISOString() ?? null,
     lastSyncedAt: row?.lastSyncedAt?.toISOString() ?? null,
     syncing: isSyncing(row),
     canRefresh: Boolean(row && status !== "disconnected" && canRefreshNow(row)),
-    lastError: row?.lastError ?? null,
+    lastError: privileged ? (row?.lastError ?? null) : null,
     lastErrorAt: row?.lastErrorAt?.toISOString() ?? null,
     lastErrorRequestId: privileged ? (row?.lastErrorRequestId ?? null) : null,
     campaigns,
@@ -96,11 +118,12 @@ export type SideshiftStatus = Awaited<ReturnType<typeof sideshiftStatus>>
 /* -------------------------------------------------------------------------- */
 
 export async function campaignAnalytics(params: {
+  tenantId: string
   campaign: string
   range: AnalyticsRange
   postSort: PostSort
 }) {
-  const tracked = await trackedCampaigns()
+  const tracked = await trackedCampaigns(params.tenantId)
   let ids = tracked.map((campaign) => campaign.id)
 
   if (params.campaign !== "all") {
@@ -137,8 +160,11 @@ export async function campaignAnalytics(params: {
     .from(sideshiftPosts)
     .where(
       and(
+        eq(sideshiftPosts.tenantId, params.tenantId),
         arrayOverlaps(sideshiftPosts.campaignIds, ids),
-        since ? gte(sideshiftPosts.uploadedAt, new Date(`${since}T00:00:00Z`)) : undefined
+        since
+          ? gte(sideshiftPosts.uploadedAt, new Date(`${since}T00:00:00Z`))
+          : undefined
       )
     )
 
@@ -154,6 +180,7 @@ export async function campaignAnalytics(params: {
     .from(sideshiftDaily)
     .where(
       and(
+        eq(sideshiftDaily.tenantId, params.tenantId),
         inArray(sideshiftDaily.campaignId, ids),
         since ? gte(sideshiftDaily.date, since) : undefined
       )
@@ -170,8 +197,11 @@ export async function campaignAnalytics(params: {
     since
   )
 
-  const engagementOf = (post: { likes: number; comments: number; shares: number }) =>
-    post.likes + post.comments + post.shares
+  const engagementOf = (post: {
+    likes: number
+    comments: number
+    shares: number
+  }) => post.likes + post.comments + post.shares
 
   const creatorKey = (post: (typeof posts)[number]) =>
     `${post.creatorId ?? post.creatorHandle ?? "unknown"}|${post.platform}`
@@ -202,7 +232,12 @@ export async function campaignAnalytics(params: {
       basis: since ? ("gained" as const) : ("total" as const),
     },
     daily,
-    creators: await buildCreators(posts, creatorKey, engagementOf),
+    creators: await buildCreators(
+      params.tenantId,
+      posts,
+      creatorKey,
+      engagementOf
+    ),
     posts: [...posts]
       .sort((a, b) =>
         params.postSort === "newest"
@@ -249,11 +284,13 @@ export const SERIES_MAX_CREATORS = 6
  * dropped, so the legend still explains what was asked for.
  */
 export async function campaignSeries(params: {
+  tenantId: string
   campaign: string
   days: number
   creators: string[]
 }) {
-  const tracked = await trackedCampaigns()
+  const { tenantId } = params
+  const tracked = await trackedCampaigns(tenantId)
   let ids = tracked.map((campaign) => campaign.id)
   let campaignName: string | null = null
 
@@ -294,17 +331,33 @@ export async function campaignSeries(params: {
       views: sql<string>`sum(${sideshiftDaily.views})`,
     })
     .from(sideshiftDaily)
-    .where(and(inArray(sideshiftDaily.campaignId, ids), gte(sideshiftDaily.date, since)))
+    .where(
+      and(
+        eq(sideshiftDaily.tenantId, params.tenantId),
+        inArray(sideshiftDaily.campaignId, ids),
+        gte(sideshiftDaily.date, since)
+      )
+    )
     .groupBy(sideshiftDaily.date)
     .orderBy(asc(sideshiftDaily.date))
 
   const daily = fillDays(
-    dailyRows.map((row) => ({ date: row.date, views: Number(row.views), engagement: 0 })),
+    dailyRows.map((row) => ({
+      date: row.date,
+      views: Number(row.views),
+      engagement: 0,
+    })),
     since
   ).map(({ date, views }) => ({ date, views }))
 
   if (params.creators.length === 0) {
-    return { campaign: params.campaign, campaignName, days: params.days, daily, creators: [] }
+    return {
+      campaign: params.campaign,
+      campaignName,
+      days: params.days,
+      daily,
+      creators: [],
+    }
   }
 
   // One row per creator account per day. The key matches `buildCreators`, so
@@ -319,9 +372,16 @@ export async function campaignSeries(params: {
       views: sql<string>`sum(${sideshiftPostDaily.views})`,
     })
     .from(sideshiftPostDaily)
-    .innerJoin(sideshiftPosts, eq(sideshiftPosts.id, sideshiftPostDaily.postId))
+    .innerJoin(
+      sideshiftPosts,
+      and(
+        eq(sideshiftPosts.tenantId, sideshiftPostDaily.tenantId),
+        eq(sideshiftPosts.id, sideshiftPostDaily.postId)
+      )
+    )
     .where(
       and(
+        eq(sideshiftPostDaily.tenantId, params.tenantId),
         inArray(sideshiftPostDaily.campaignId, ids),
         gte(sideshiftPostDaily.date, since)
       )
@@ -373,7 +433,12 @@ export async function campaignSeries(params: {
       : await db
           .select()
           .from(sideshiftCreators)
-          .where(inArray(sideshiftCreators.id, Array.from(new Set(creatorIds))))
+          .where(
+            and(
+              eq(sideshiftCreators.tenantId, tenantId),
+              inArray(sideshiftCreators.id, Array.from(new Set(creatorIds)))
+            )
+          )
   const byId = new Map(identities.map((identity) => [identity.id, identity]))
 
   return {
@@ -389,7 +454,7 @@ export async function campaignSeries(params: {
         key,
         name: identity?.name ?? group?.name ?? group?.handle ?? null,
         handle: group?.handle ?? null,
-        platform: group?.platform ?? (key.split("|").pop() ?? ""),
+        platform: group?.platform ?? key.split("|").pop() ?? "",
         avatarUrl: identity?.avatarUrl ?? null,
         daily: group
           ? fillDays(
@@ -442,6 +507,7 @@ async function buildCreators<
     shares: number
   },
 >(
+  tenantId: string,
   posts: Post[],
   keyOf: (post: Post) => string,
   engagementOf: (post: Post) => number
@@ -487,7 +553,12 @@ async function buildCreators<
       : await db
           .select()
           .from(sideshiftCreators)
-          .where(inArray(sideshiftCreators.id, Array.from(new Set(creatorIds))))
+          .where(
+            and(
+              eq(sideshiftCreators.tenantId, tenantId),
+              inArray(sideshiftCreators.id, Array.from(new Set(creatorIds)))
+            )
+          )
 
   const byId = new Map(identities.map((identity) => [identity.id, identity]))
 

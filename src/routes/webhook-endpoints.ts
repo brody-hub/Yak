@@ -1,4 +1,4 @@
-import { desc, eq } from "drizzle-orm"
+import { and, desc, eq } from "drizzle-orm"
 import { Router } from "express"
 import { z } from "zod"
 
@@ -6,10 +6,14 @@ import { db } from "../db/index.js"
 import { webhookDeliveries, webhookEndpoints } from "../db/schema.js"
 import { encryptSecret, generateWebhookSecret, newId } from "../lib/crypto.js"
 import { BadRequestError, NotFoundError } from "../lib/errors.js"
-import { getAuth } from "../middleware/auth.js"
+import { getAuth, getTenantId } from "../middleware/auth.js"
 import { validate } from "../middleware/validate.js"
 import { recordActivity } from "../services/activity.js"
-import { WEBHOOK_EVENTS, assertSafeWebhookUrl } from "../services/webhooks.js"
+import {
+  WEBHOOK_EVENTS,
+  assertSafeWebhookUrl,
+  webhookBinding,
+} from "../services/webhooks.js"
 
 export const webhookEndpointsRouter: Router = Router()
 
@@ -31,10 +35,11 @@ webhookEndpointsRouter.get("/events", (_req, res) => {
   res.json({ data: WEBHOOK_EVENTS })
 })
 
-webhookEndpointsRouter.get("/", async (_req, res) => {
+webhookEndpointsRouter.get("/", async (req, res) => {
   const rows = await db
     .select()
     .from(webhookEndpoints)
+    .where(eq(webhookEndpoints.tenantId, getTenantId(req)))
     .orderBy(desc(webhookEndpoints.createdAt))
 
   res.json({ data: rows.map(serialize) })
@@ -57,6 +62,7 @@ webhookEndpointsRouter.post(
   }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
     const body = req.body as {
       url: string
       events: string[]
@@ -75,10 +81,11 @@ webhookEndpointsRouter.post(
       .insert(webhookEndpoints)
       .values({
         id: newId(),
+        tenantId,
         url: body.url,
         events: body.events,
         enabled: body.enabled,
-        secretEncrypted: encryptSecret(secret),
+        secretEncrypted: encryptSecret(secret, webhookBinding(tenantId)),
         secretHint: `${secret.slice(0, 11)}…`,
         createdByUserId: user.id,
       })
@@ -89,6 +96,7 @@ webhookEndpointsRouter.post(
     }
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "created",
       section: "user-management",
@@ -123,6 +131,7 @@ webhookEndpointsRouter.patch(
   }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
     const body = req.body as {
       url?: string
       events?: string[]
@@ -140,7 +149,12 @@ webhookEndpointsRouter.patch(
     const [row] = await db
       .update(webhookEndpoints)
       .set({ ...body, updatedAt: new Date() })
-      .where(eq(webhookEndpoints.id, req.params.id as string))
+      .where(
+        and(
+          eq(webhookEndpoints.tenantId, tenantId),
+          eq(webhookEndpoints.id, req.params.id as string)
+        )
+      )
       .returning()
 
     if (!row) {
@@ -148,6 +162,7 @@ webhookEndpointsRouter.patch(
     }
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "updated",
       section: "user-management",
@@ -164,21 +179,27 @@ webhookEndpointsRouter.delete(
   validate({ params: idParamSchema }),
   async (req, res) => {
     const { user } = getAuth(req)
+    const tenantId = getTenantId(req)
     const id = req.params.id as string
+    const thisEndpoint = and(
+      eq(webhookEndpoints.tenantId, tenantId),
+      eq(webhookEndpoints.id, id)
+    )
 
     const [row] = await db
       .select()
       .from(webhookEndpoints)
-      .where(eq(webhookEndpoints.id, id))
+      .where(thisEndpoint)
       .limit(1)
 
     if (!row) {
       throw new NotFoundError("Webhook endpoint")
     }
 
-    await db.delete(webhookEndpoints).where(eq(webhookEndpoints.id, id))
+    await db.delete(webhookEndpoints).where(thisEndpoint)
 
     await recordActivity({
+      tenantId,
       userId: user.id,
       action: "deleted",
       section: "user-management",
@@ -197,7 +218,12 @@ webhookEndpointsRouter.get(
     const rows = await db
       .select()
       .from(webhookDeliveries)
-      .where(eq(webhookDeliveries.endpointId, req.params.id as string))
+      .where(
+        and(
+          eq(webhookDeliveries.tenantId, getTenantId(req)),
+          eq(webhookDeliveries.endpointId, req.params.id as string)
+        )
+      )
       .orderBy(desc(webhookDeliveries.createdAt))
       .limit(50)
 

@@ -122,43 +122,59 @@ export type DirectUpload = {
 }
 
 function objectKey(params: {
+  tenantId: string
   purpose: "avatar" | "branding"
   requestedByUserId: string
   contentType: string
 }): string {
   const ext = EXT_BY_TYPE[params.contentType] ?? "bin"
-  return `${env.TENANT_SLUG}/${params.purpose}/${params.requestedByUserId}/${randomUUID()}.${ext}`
+  return `${params.tenantId}/${params.purpose}/${params.requestedByUserId}/${randomUUID()}.${ext}`
 }
 
 /**
  * Mints a short-lived PUT URL. The returned `imageId` is the R2 object key to
  * persist after the browser finishes the upload.
  */
+/** Logos and avatars; anything bigger is not an image for a panel. */
+export const MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+
 export async function createDirectUpload(params: {
+  tenantId: string
   requestedByUserId: string
   purpose: "avatar" | "branding"
-  contentType?: string
+  contentType: string
+  sizeBytes: number
 }): Promise<DirectUpload> {
   const { bucket } = requireConfigured()
 
-  const contentType = params.contentType
-    ? normalizeContentType(params.contentType)
-    : "image/png"
+  const contentType = normalizeContentType(params.contentType)
 
   if (!ALLOWED_CONTENT_TYPES.has(contentType)) {
     throw new BadRequestError("Unsupported image type")
   }
 
+  if (
+    !Number.isInteger(params.sizeBytes) ||
+    params.sizeBytes <= 0 ||
+    params.sizeBytes > MAX_UPLOAD_BYTES
+  ) {
+    throw new BadRequestError("Image is too large")
+  }
+
   const key = objectKey({
+    tenantId: params.tenantId,
     purpose: params.purpose,
     requestedByUserId: params.requestedByUserId,
     contentType,
   })
 
+  // Content type and length are part of the signature, so the URL can only
+  // store an object of this type and exactly this size.
   const command = new PutObjectCommand({
     Bucket: bucket,
     Key: key,
     ContentType: contentType,
+    ContentLength: params.sizeBytes,
   })
 
   const uploadUrl = await getSignedUrl(getClient(), command, {
@@ -239,13 +255,32 @@ export async function createSignedReadUrl(
   )
 }
 
-/** Keys we mint look like `tenant/purpose/userId/uuid.ext`. */
+/**
+ * Keys we mint look like `tenantId/purpose/userId/uuid.ext`. Keys from before
+ * multi-tenancy have the old TENANT_SLUG in the first segment and the same
+ * shape otherwise. The media route serves any key of this shape: keys are
+ * unguessable, and logos and avatars are shown on screens anyway.
+ */
+const MANAGED_KEY =
+  /^[A-Za-z0-9_-]+\/(avatar|branding)\/[A-Za-z0-9_-]+\/[A-Za-z0-9.-]+$/
+
 export function isManagedObjectKey(key: string): boolean {
-  return new RegExp(
-    `^${escapeRegex(env.TENANT_SLUG)}/(avatar|branding)/[A-Za-z0-9_-]+/[A-Za-z0-9.-]+$`
-  ).test(key)
+  return MANAGED_KEY.test(key)
 }
 
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+/**
+ * Whether a key was minted for this tenant (and, for avatars, this user), so
+ * nobody can point their logo or avatar at another tenant's upload.
+ */
+export function isTenantObjectKey(
+  key: string,
+  tenantId: string,
+  purpose: "avatar" | "branding",
+  userId?: string
+): boolean {
+  const prefix = userId
+    ? `${tenantId}/${purpose}/${userId}/`
+    : `${tenantId}/${purpose}/`
+
+  return isManagedObjectKey(key) && key.startsWith(prefix)
 }

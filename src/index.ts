@@ -6,38 +6,69 @@ console.error("[boot] process starting")
 
 try {
   const { createApp } = await import("./app.js")
-  const { closeDatabase } = await import("./db/index.js")
+  const { checkDatabaseRole, closeDatabase } = await import("./db/index.js")
   const { env } = await import("./env.js")
   const { logger } = await import("./logger.js")
 
   console.error(`[boot] modules loaded, binding 0.0.0.0:${env.PORT}`)
 
-  // Optional first-boot path when OWNER_EMAIL is set and the users table is empty.
-  const { bootstrapOwnerFromEnv, resetOwnerFromEnv } = await import(
-    "./scripts/create-owner.js"
-  )
-  const bootstrap = await bootstrapOwnerFromEnv()
+  // Tenant isolation rests on Postgres row level security, which superusers
+  // and BYPASSRLS roles skip entirely. Refuse to serve customers that way.
+  const dbRole = await checkDatabaseRole()
+
+  if (dbRole.bypassesRowSecurity) {
+    if (env.isProduction) {
+      console.error(
+        `[boot] refusing to start: database role "${dbRole.role}" bypasses row level security. Connect as a plain role (see docs/DEPLOYMENT.md).`
+      )
+      await closeDatabase()
+      process.exit(1)
+    }
+
+    console.error(
+      `[boot] WARNING: database role "${dbRole.role}" bypasses row level security; tenant isolation is enforced by the application only in this environment`
+    )
+  } else {
+    console.error(
+      `[boot] database role "${dbRole.role}" is subject to row level security`
+    )
+  }
+
+  // Optional first-boot path when SUPER_ADMIN_EMAIL is set and no super admin
+  // exists yet.
+  const { bootstrapSuperAdminFromEnv, resetSuperAdminFromEnv } =
+    await import("./scripts/create-owner.js")
+  const bootstrap = await bootstrapSuperAdminFromEnv()
 
   if (bootstrap?.status === "created") {
-    console.error(`[boot] owner created for ${bootstrap.email}`)
+    console.error(`[boot] super admin created for ${bootstrap.email}`)
     if (!bootstrap.inviteEmailSent) {
       console.error(`[boot] temporary password: ${bootstrap.temporaryPassword}`)
       console.error("[boot] change it immediately after signing in")
     }
   } else if (bootstrap?.status === "exists") {
-    console.error(`[boot] owner already exists (${bootstrap.email})`)
+    console.error(`[boot] super admin already exists (${bootstrap.email})`)
   } else if (bootstrap?.status === "skipped") {
-    console.error(`[boot] owner bootstrap skipped: ${bootstrap.reason}`)
+    console.error(`[boot] super admin bootstrap skipped: ${bootstrap.reason}`)
   }
 
-  const reset = await resetOwnerFromEnv()
+  const reset = await resetSuperAdminFromEnv()
 
   if (reset?.status === "reset") {
-    console.error(`[boot] owner password reset for ${reset.email}`)
-    console.error(`[boot] temporary password: ${reset.temporaryPassword}`)
-    console.error("[boot] change it immediately after signing in")
+    console.error(`[boot] super admin password reset for ${reset.email}`)
+    if (reset.emailSent) {
+      console.error("[boot] temporary password emailed")
+    } else if (reset.temporaryPassword) {
+      // Only without an email service. Rotate it as soon as you are in.
+      console.error(`[boot] temporary password: ${reset.temporaryPassword}`)
+      console.error("[boot] change it immediately after signing in")
+    } else {
+      console.error(
+        "[boot] the password email could not be sent; set SUPER_ADMIN_RESET_PASSWORD again once email works"
+      )
+    }
   } else if (reset?.status === "skipped") {
-    console.error(`[boot] owner password reset skipped: ${reset.reason}`)
+    console.error(`[boot] super admin password reset skipped: ${reset.reason}`)
   }
 
   const app = createApp()
@@ -51,8 +82,11 @@ try {
         appUrl: env.APP_URL,
         emailConfigured: env.email.configured,
         imagesConfigured: env.images.configured,
+        stripeConfigured: env.stripe.configured,
+        stripeMode: env.stripe.configured ? env.stripe.mode : null,
+        databaseRole: dbRole.role,
       },
-      `${env.TENANT_NAME} API listening`
+      `${env.APP_NAME} API listening`
     )
   })
 
